@@ -1,0 +1,32 @@
+# Rust build artifacts
+/target/
+
+# Local package database and runtime state
+/var/
+
+# Built packages and repository artifacts
+/repo/*.xpkg
+/repo/*.xpkg.sig
+/repo/*.sig
+/repo/*.deb
+/repo/*.rpm
+/repo/*.pkg.tar.*
+/repo/*.zst
+*.xpkg
+*.deb
+*.rpm
+*.pkg.tar.*
+*.zst
+
+# Test roots / disk images
+/target_rootfs*
+*.img
+*.iso
+
+# Logs and temporary files
+*.log
+*.part
+*.tmp
+
+# Local caches
+/.cache/

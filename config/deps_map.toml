@@ -1,0 +1,7 @@
+# xrpkg 外部依赖映射表
+# 左边是 Debian/RPM/Arch 的依赖源名称，右边是 xrpkg 内部 Capability。
+[mappings]
+"libc6" = "glibc >= 2.44"
+"libssl3" = "openssl >= 3.0"
+"openssl-libs" = "openssl >= 3.0"
+"libc.so.6" = "glibc >= 2.44"

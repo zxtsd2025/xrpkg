@@ -1,0 +1,90 @@
+# xrpkg 阶段 3 的外部包数据。
+# 每个 [[scenarios]] 是一个独立场景，requires 中的每一项都由 Capability::parse 解析。
+
+[[scenarios]]
+title = "场景 1：链式依赖 app -> libbar -> libfoo"
+root = "app"
+
+[[scenarios.packages]]
+name = "libfoo"
+version = "1.5"
+requires = []
+
+[[scenarios.packages]]
+name = "libbar"
+version = "1.0"
+requires = ["libfoo >= 1.0"]
+
+[[scenarios.packages]]
+name = "app"
+version = "1.0"
+requires = ["libbar >= 1.0"]
+
+[[scenarios]]
+title = "场景 2：多版本候选，app 依赖 libfoo >= 2.0"
+root = "app"
+
+[[scenarios.packages]]
+name = "libfoo"
+version = "1.5"
+requires = []
+
+[[scenarios.packages]]
+name = "libfoo"
+version = "2.1"
+requires = []
+
+[[scenarios.packages]]
+name = "app"
+version = "1.0"
+requires = ["libfoo >= 2.0"]
+
+[[scenarios]]
+title = "场景 3：冲突无解，app 依赖 libfoo >= 3.0，但仓库只有 1.5/2.1"
+root = "app"
+
+[[scenarios.packages]]
+name = "libfoo"
+version = "1.5"
+requires = []
+
+[[scenarios.packages]]
+name = "libfoo"
+version = "2.1"
+requires = []
+
+[[scenarios.packages]]
+name = "app"
+version = "1.0"
+requires = ["libfoo >= 3.0"]
+
+# 阶段 3 的可用仓库：install 只从这个列表里选包。
+# 保留上面的 scenarios 供阶段 1/2 的回归测试使用。
+[[repository]]
+name = "libfoo"
+version = "1.5"
+requires = []
+
+[[repository]]
+name = "libfoo"
+version = "2.1"
+requires = []
+
+[[repository]]
+name = "libbar"
+version = "1.0"
+requires = ["libfoo >= 1.0"]
+
+[[repository]]
+name = "app"
+version = "1.0"
+requires = ["libbar >= 1.0"]
+[[repository]]
+name = "glibc"
+version = "2.44"
+requires = []
+
+[[repository]]
+name = "openssl"
+version = "3.1"
+requires = []

@@ -1,0 +1,59 @@
+format = 1
+name = "repo"
+arch = "x86_64"
+
+[[packages]]
+name = "app"
+version = "1.0"
+requires = ["libbar >= 1.0"]
+filename = "app-1.0.xpkg"
+sha256 = "3831c69c23dba7926d912505cefb1c3ce3be3b927c7099c1c0006617a71f5210"
+
+[[packages]]
+name = "glibc"
+version = "2.44"
+requires = []
+filename = "glibc-2.44.xpkg"
+sha256 = "da0ecae566f0727d3d377d51763149a605e077e45b048040c8f862ed7cb1430b"
+
+[[packages]]
+name = "hello"
+version = "1.0"
+requires = []
+filename = "hello-1.0.xpkg"
+sha256 = "061a8a5647bc48bba4a059e6ae849594024d45efcb240fe6597a238073456f3e"
+
+[[packages]]
+name = "libbar"
+version = "1.0"
+requires = ["libfoo >= 1.0"]
+filename = "libbar-1.0.xpkg"
+sha256 = "bd4f7a195cbde395acec662959977091272fc152c34de1ae3d116a52f86c55f4"
+
+[[packages]]
+name = "libfoo"
+version = "1.5"
+requires = []
+filename = "libfoo-1.5.xpkg"
+sha256 = "1d1edd6d9e81e52eaeb9f44d5433809194a176aab52434dd4beb321d1c409dc8"
+
+[[packages]]
+name = "libfoo"
+version = "2.1"
+requires = []
+filename = "libfoo-2.1.xpkg"
+sha256 = "722136800687e5eb05a97edd6f9750e5cfc263a9bd02a90ed8eaee2cf7a22190"
+
+[[packages]]
+name = "openssl"
+version = "3.1"
+requires = []
+filename = "openssl-3.1.xpkg"
+sha256 = "b22304174833323a09cefeb6f7784d8696a8e455eaec291dfcd04a5fb640e7ba"
+
+[[packages]]
+name = "zlib"
+version = "1.3.1"
+requires = []
+filename = "zlib-1.3.1.xpkg"
+sha256 = "9ea904e1bbb72d285cb67ca69316630c56df8a9ce8e8ea804e2dc34da0c0962e"

@@ -1,0 +1,21 @@
+# LFS 12.1 Binutils-2.42，采用第 8 章 native 安装方式。
+# gmp/mpfr/mpc 使用源码树内 in-tree 构建；touch Makefile.in 避免
+# 解压时间戳触发 automake-1.16 重新生成。
+name = "binutils"
+version = "2.42"
+source = [
+  { url = "https://sourceware.org/pub/binutils/releases/binutils-2.42.tar.xz", sha256 = "f6e4d41fd5fc778b06b7891457b3620da5ecea1006c6a4a41ae998109f85a800" },
+  { url = "https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz", sha256 = "a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898" },
+  { url = "https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz", sha256 = "277807353a6726978996945af13e52829e3abd7a9a5b7fb2793894e18f1fcbb2" },
+  { url = "https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz", sha256 = "ab642492f5cf882b74aa0cb730cd410a81edcdbec895183ce930e706c1c759b8" },
+]
+requires = []
+
+build = [
+  "cd binutils-2.42 && mv ../gmp-6.3.0 gmp && mv ../mpfr-4.2.1 mpfr && mv ../mpc-1.3.1 mpc && find gmp mpfr mpc -name Makefile.in -exec touch {} + && mkdir -p build && cd build && ../configure --prefix=/usr --sysconfdir=/etc --localstatedir=/var --enable-gold --enable-ld=default --enable-plugins --enable-shared --disable-werror --enable-64-bit-bfd --with-system-zlib --enable-default-hash-style=gnu --disable-nls --disable-multilib --enable-gprofng=no",
+  "cd binutils-2.42/build && make tooldir=/usr",
+]
+
+package = [
+  "cd binutils-2.42/build && make DESTDIR=\"$PKGDIR\" tooldir=/usr install",
+]

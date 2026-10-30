@@ -1,0 +1,12 @@
+name = "hello"
+version = "1.0"
+source = "hello"
+requires = []
+
+build = [
+  "cc -O2 -Wall -Wextra -o hello hello.c",
+]
+
+package = [
+  "install -Dm755 hello \"$PKGDIR/usr/bin/hello\"",
+]

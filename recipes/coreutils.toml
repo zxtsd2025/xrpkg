@@ -1,0 +1,16 @@
+# LFS 12.1 Coreutils-9.4。
+name = "coreutils"
+version = "9.4"
+source = [
+  { url = "https://ftp.gnu.org/gnu/coreutils/coreutils-9.4.tar.xz", sha256 = "ea613a4cf44612326e917201bbbcdfbd301de21ffc3b59b6e5c07e040b275e52" },
+]
+requires = ["glibc >= 2.0"]
+
+build = [
+  "cd coreutils-9.4 && find . \\( -name aclocal.m4 -o -name Makefile.in -o -name configure \\) -exec touch {} + && FORCE_UNSAFE_CONFIGURE=1 ./configure --prefix=/usr --enable-no-install-program=kill,uptime",
+  "cd coreutils-9.4 && make",
+]
+
+package = [
+  "cd coreutils-9.4 && make DESTDIR=\"$PKGDIR\" install",
+]

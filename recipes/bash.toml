@@ -1,0 +1,17 @@
+# LFS 12.1 Bash-5.2.21；使用自带 readline，避免额外运行时依赖。
+name = "bash"
+version = "5.2.21"
+source = [
+  { url = "https://ftp.gnu.org/gnu/bash/bash-5.2.21.tar.gz", sha256 = "c8e31bdc59b69aaffc5b36509905ba3e5cbb12747091d27b4b977f078560d5b8" },
+]
+requires = ["glibc >= 2.0"]
+
+build = [
+  "cd bash-5.2.21 && CFLAGS='-std=gnu17 -O2' ./configure --prefix=/usr --without-bash-malloc",
+  "cd bash-5.2.21 && make CFLAGS='-std=gnu17 -O2'",
+]
+
+package = [
+  "cd bash-5.2.21 && make CFLAGS='-std=gnu17 -O2' DESTDIR=\"$PKGDIR\" install",
+  "ln -sfv bash \"$PKGDIR/usr/bin/sh\"",
+]

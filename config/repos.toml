@@ -1,0 +1,6 @@
+# 信任公钥环；默认是配置文件同目录的 trusted.gpg。
+# keyring = "trusted.gpg"
+# 本地演示仓库；实际部署时改成 http(s) 或其它 file:// 路径。
+[[repos]]
+name = "repo"
+url = "file:///home/zxtsd/xrpkg/repo"

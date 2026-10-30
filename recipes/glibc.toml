@@ -1,0 +1,17 @@
+# LFS 12.1 Glibc-2.39，源码树外构建。
+name = "glibc"
+version = "2.39"
+source = [
+  { url = "https://ftp.gnu.org/gnu/glibc/glibc-2.39.tar.xz", sha256 = "f77bd47cf8170c57365ae7bf86696c118adb3b120d3259c64c502d3dc1e2d926" },
+]
+patches = ["glibc-2.39-fhs-1.patch"]
+requires = []
+
+build = [
+  "cd glibc-2.39 && patch -Np1 -i ../glibc-2.39-fhs-1.patch && mkdir -p build && cd build && echo 'rootsbindir=/usr/sbin' > configparms && ../configure --prefix=/usr --disable-werror --enable-kernel=4.19 --enable-stack-protector=strong --disable-nscd libc_cv_slibdir=/usr/lib",
+  "cd glibc-2.39/build && make",
+]
+
+package = [
+  "cd glibc-2.39/build && mkdir -p \"$PKGDIR/etc\" && touch \"$PKGDIR/etc/ld.so.conf\" && sed '/test-installation/s@$(PERL)@echo not running@' -i ../Makefile && make DESTDIR=\"$PKGDIR\" install && sed '/RTLDLIST=/s@/usr@@g' -i \"$PKGDIR/usr/bin/ldd\"",
+]

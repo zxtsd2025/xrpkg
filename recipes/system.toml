@@ -1,0 +1,27 @@
+# XROS beta1.0 全系统构建清单（xrpkg build-world）：顺序就是构建顺序，build-world 不会重新排序。
+# 相对路径以本文件所在目录（recipes/）为基准。
+#
+# 1. glibc      C 运行时，所有用户态二进制的基础
+# 2. binutils   ld/as/ar 等链接与汇编工具
+# 3. gcc        C/C++ 编译器
+# 4. zlib       压缩库
+# 5. gmp        libgmp.so.10（ISL 运行时依赖）
+# 6. isl        libisl.so.23（cc1 运行时依赖）
+# 7. zstd       libzstd.so.1（binutils/gcc 运行时依赖）
+# 8. ncurses    libncursesw.so.6（bash 运行时依赖）
+# 9. bash       shell 与 /bin/sh
+# 10. coreutils 基础用户态命令（关闭 libcap，避免额外运行时依赖）
+# 11. linux     内核最后构建，依赖前面完整的工具链
+recipes = [
+  "glibc.toml",
+  "binutils.toml",
+  "gcc.toml",
+  "zlib.toml",
+  "gmp.toml",
+  "isl.toml",
+  "zstd.toml",
+  "ncurses.toml",
+  "bash.toml",
+  "coreutils.toml",
+  "linux.toml",
+]

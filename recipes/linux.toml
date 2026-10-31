@@ -7,7 +7,8 @@ source = [
 requires = []
 
 build = [
-  "cd linux-6.7.4 && make mrproper && make defconfig && scripts/config --disable WERROR --disable DEBUG_INFO_BTF --disable EFI",
+  "cd linux-6.7.4 && make mrproper && make defconfig && scripts/config --disable WERROR --disable DEBUG_INFO_BTF --enable BLK_DEV_NVME --enable EXT4_FS --enable EFI --enable FB --enable FB_EFI --enable FAT_FS --enable VFAT_FS --enable DEVTMPFS --enable DEVTMPFS_MOUNT && make olddefconfig",
+  "cd linux-6.7.4 && grep -qx \"CONFIG_BLK_DEV_NVME=y\" .config && grep -qx \"CONFIG_EXT4_FS=y\" .config && grep -qx \"CONFIG_EFI=y\" .config && grep -qx \"CONFIG_FB_EFI=y\" .config && grep -qx \"CONFIG_VFAT_FS=y\" .config && grep -qx \"CONFIG_DEVTMPFS=y\" .config && grep -qx \"CONFIG_DEVTMPFS_MOUNT=y\" .config",
   "cd linux-6.7.4 && make CC=\"gcc -std=gnu11\" HOSTCC=\"gcc -std=gnu11\" KCFLAGS=\"-std=gnu11\"",
 ]
 

@@ -23,6 +23,7 @@ use xrpkg::solver::{Package, SelectedPackage};
 use xrpkg::state::{InstalledPackage, LocalDb, PackageInstall};
 use xrpkg::sync;
 use xrpkg::uninstall;
+use xrpkg::world;
 use xrpkg::xpkg::{self, Rootfs};
 
 /// 硬编码的本次安装目标，模拟 `install app`。
@@ -66,6 +67,7 @@ struct Cli {
     no_sandbox: bool,
     jobs: Option<usize>,
     init: bool,
+    build_world: bool,
 }
 
 /// 在 Rootfs 中生成最小可启动/可 chroot 的基础配置文件。
@@ -206,9 +208,40 @@ fn run() -> Result<(), String> {
         + usize::from(cli.search.is_some())
         + usize::from(cli.install.is_some())
         + usize::from(cli.sync.is_some())
-        + usize::from(cli.sync_all);
+        + usize::from(cli.sync_all)
+        + usize::from(cli.build_world);
     if action_count > 1 {
         return Err("构建、卸载、仓库、同步和兼容轨道操作只能选择一个".to_string());
+    }
+
+    if cli.build_world {
+        // `--config` 在 build-world 下指向系统清单，默认 recipes/system.toml。
+        let config_path = cli
+            .config
+            .clone()
+            .unwrap_or_else(|| project_root.join("recipes/system.toml"));
+        let repo_dir = cli
+            .repo_dir
+            .clone()
+            .unwrap_or_else(|| project_root.join("repo"));
+        let log_path = builder::cache_root()?.join("logs").join("build-world.log");
+        let options = world::WorldOptions {
+            sandbox: !cli.no_sandbox,
+            jobs: cli.jobs,
+            no_hooks: cli.no_hooks,
+            log_path,
+        };
+        world::build_world(
+            &config_path,
+            &repo_dir,
+            &cli.rootfs,
+            &database_path(project_root, &cli),
+            &options,
+        )?;
+        println!();
+        let db = LocalDb::open(database_path(project_root, &cli))?;
+        list(&db)?;
+        return Ok(());
     }
 
     if cli.sync_all || cli.sync.is_some() {
@@ -493,6 +526,7 @@ fn parse_cli() -> Result<Cli, String> {
     let mut no_sandbox = false;
     let mut jobs = None;
     let mut init = false;
+    let mut build_world = false;
     let mut arguments = std::env::args().skip(1).collect::<Vec<_>>();
 
     if !arguments.is_empty() {
@@ -517,6 +551,7 @@ fn parse_cli() -> Result<Cli, String> {
             "update" => update = true,
             "clean" => clean = true,
             "init" => init = true,
+            "build-world" => build_world = true,
             "search" => {
                 if arguments.is_empty() {
                     return Err("用法: xrpkg search <keyword>".to_string());
@@ -639,7 +674,7 @@ fn parse_cli() -> Result<Cli, String> {
             }
             _ => {
                 return Err(format!(
-                    "未知参数 `{argument}`；支持 init/install/update/clean/search/sync/repo-add/repo-sign 子命令，或 `--root <dir>`、`--build <recipe>`、`--remove <pkg>`、`--deb <file>`、`--rpm <file>`、`--arch <file>`、`--config <file>`、`--mirrors <file>`、`--repo-dir <dir>`、`--cache <dir>`、`--key <gpg-key>`、`--allow-downgrade`、`--prefer-arch`、`--jobs <n>`、`--no-sandbox` 和 `--no-hooks`"
+                    "未知参数 `{argument}`；支持 init/install/update/clean/search/sync/repo-add/repo-sign/build-world 子命令，或 `--root <dir>`、`--build <recipe>`、`--remove <pkg>`、`--deb <file>`、`--rpm <file>`、`--arch <file>`、`--config <file>`、`--mirrors <file>`、`--repo-dir <dir>`、`--cache <dir>`、`--key <gpg-key>`、`--allow-downgrade`、`--prefer-arch`、`--jobs <n>`、`--no-sandbox` 和 `--no-hooks`"
                 ))
             }
         }
@@ -672,6 +707,7 @@ fn parse_cli() -> Result<Cli, String> {
         no_sandbox,
         jobs,
         init,
+        build_world,
     })
 }
 

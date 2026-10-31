@@ -1,0 +1,16 @@
+# ISL-0.26；为 GCC 的 cc1 提供 libisl.so.23 运行时。
+name = "isl"
+version = "0.26"
+source = [
+  { url = "https://libisl.sourceforge.io/isl-0.26.tar.xz", sha256 = "a0b5cb06d24f9fa9e77b55fabbe9a3c94a336190345c2555f9915bb38e976504" },
+]
+requires = ["glibc >= 2.0", "gmp >= 6.0"]
+
+build = [
+  "cd isl-0.26 && find . -name configure.ac -exec touch {} + && find . -name aclocal.m4 -exec touch {} + && find . -name configure -exec touch {} + && find . -name Makefile.in -exec touch {} + && CFLAGS='-O2 -std=gnu17' ./configure --prefix=/usr --with-gmp-prefix=/usr --disable-static --enable-shared",
+  "cd isl-0.26 && make",
+]
+
+package = [
+  "cd isl-0.26 && make DESTDIR=\"$PKGDIR\" install",
+]

@@ -57,6 +57,25 @@ struct BuildScript {
     patches: Vec<String>,
 }
 
+/// 配方身份：只包含 `name` 和 `version`，供 build-world 决定归档名和数据库身份。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecipeIdentity {
+    pub name: String,
+    pub version: String,
+}
+
+/// 只读取配方的 `name`/`version`，不下载源码、不执行 build/package。
+pub fn read_recipe_identity(script_path: &Path) -> Result<RecipeIdentity, Error> {
+    let script_text = fs::read_to_string(script_path)
+        .map_err(|error| format!("读取构建脚本 `{}` 失败: {error}", script_path.display()))?;
+    let script: BuildScript = toml::from_str(&script_text)
+        .map_err(|error| format!("解析构建脚本 `{}` 失败: {error}", script_path.display()))?;
+    Ok(RecipeIdentity {
+        name: script.name,
+        version: script.version,
+    })
+}
+
 /// 源码来源：本地目录，或一组远程/本地归档。
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -566,8 +585,8 @@ fn downloads_dir() -> Result<PathBuf, Error> {
     Ok(directory)
 }
 
-/// 返回 XDG 缓存根：`$XDG_CACHE_HOME` 或 `$HOME/.cache`。
-fn cache_root() -> Result<PathBuf, Error> {
+/// 返回 XDG 缓存根：`$XDG_CACHE_HOME` 或 `$HOME/.cache`；build-world 也用它定位编排日志。
+pub fn cache_root() -> Result<PathBuf, Error> {
     if let Some(cache) = std::env::var_os("XDG_CACHE_HOME") {
         return Ok(PathBuf::from(cache).join("xrpkg"));
     }

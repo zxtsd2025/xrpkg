@@ -1,0 +1,16 @@
+# XROS beta1.0 / LFS 12.1 Ncurses-6.4；bash 需要 libncursesw.so.6。
+name = "ncurses"
+version = "6.4"
+source = [
+  { url = "https://ftp.gnu.org/gnu/ncurses/ncurses-6.4.tar.gz", sha256 = "6931283d9ac87c5073f30b6290c4c75f21632bb4fc3603ac8100812bed248159" },
+]
+requires = ["glibc >= 2.0"]
+
+build = [
+  "cd ncurses-6.4 && ./configure --prefix=/usr --mandir=/usr/share/man --with-shared --enable-widec --without-debug --without-normal --without-cxx-binding --without-ada --enable-pc-files --with-pkg-config-libdir=/usr/lib/pkgconfig",
+  "cd ncurses-6.4 && make",
+]
+
+package = [
+  "cd ncurses-6.4 && make DESTDIR=\"$PKGDIR\" install",
+]

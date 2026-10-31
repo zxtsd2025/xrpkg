@@ -19,4 +19,5 @@ pub mod solver;
 pub mod state;
 pub mod sync;
 pub mod uninstall;
+pub mod world;
 pub mod xpkg;

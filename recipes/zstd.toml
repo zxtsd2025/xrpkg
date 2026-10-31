@@ -1,0 +1,15 @@
+# Zstandard-1.5.5；为 binutils/gcc 提供 libzstd.so.1 运行时。
+name = "zstd"
+version = "1.5.5"
+source = [
+  { url = "https://github.com/facebook/zstd/releases/download/v1.5.5/zstd-1.5.5.tar.gz", sha256 = "9c4396cc829cfae319a6e2615202e82aad41372073482fce286fac78646d3ee4" },
+]
+requires = ["glibc >= 2.0"]
+
+build = [
+  "cd zstd-1.5.5 && make",
+]
+
+package = [
+  "cd zstd-1.5.5 && make DESTDIR=\"$PKGDIR\" prefix=/usr install",
+]

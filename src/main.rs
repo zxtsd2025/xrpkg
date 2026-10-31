@@ -65,6 +65,7 @@ struct Cli {
     cache: Option<PathBuf>,
     allow_downgrade: bool,
     no_sandbox: bool,
+    no_deps: bool,
     jobs: Option<usize>,
     init: bool,
     build_world: bool,
@@ -364,6 +365,7 @@ fn run() -> Result<(), String> {
                     &installed,
                     &mapper,
                     cli.no_hooks,
+                    cli.no_deps,
                 )?;
             } else {
                 return Err(format!(
@@ -409,6 +411,7 @@ fn run() -> Result<(), String> {
                 &installed,
                 &mapper,
                 cli.no_hooks,
+                cli.no_deps,
             )?;
         }
         println!();
@@ -479,6 +482,7 @@ fn run() -> Result<(), String> {
                 &installed,
                 &mapper,
                 cli.no_hooks,
+                cli.no_deps,
             )?;
         }
         return Ok(());
@@ -524,6 +528,7 @@ fn parse_cli() -> Result<Cli, String> {
     let mut cache = None;
     let mut allow_downgrade = false;
     let mut no_sandbox = false;
+    let mut no_deps = false;
     let mut jobs = None;
     let mut init = false;
     let mut build_world = false;
@@ -612,6 +617,7 @@ fn parse_cli() -> Result<Cli, String> {
             "--prefer-arch" => prefer_arch = true,
             "--all" => sync_all = true,
             "--no-sandbox" => no_sandbox = true,
+            "--no-deps" => no_deps = true,
             "--jobs" => {
                 let value = arguments
                     .next()
@@ -674,7 +680,7 @@ fn parse_cli() -> Result<Cli, String> {
             }
             _ => {
                 return Err(format!(
-                    "未知参数 `{argument}`；支持 init/install/update/clean/search/sync/repo-add/repo-sign/build-world 子命令，或 `--root <dir>`、`--build <recipe>`、`--remove <pkg>`、`--deb <file>`、`--rpm <file>`、`--arch <file>`、`--config <file>`、`--mirrors <file>`、`--repo-dir <dir>`、`--cache <dir>`、`--key <gpg-key>`、`--allow-downgrade`、`--prefer-arch`、`--jobs <n>`、`--no-sandbox` 和 `--no-hooks`"
+                    "未知参数 `{argument}`；支持 init/install/update/clean/search/sync/repo-add/repo-sign/build-world 子命令，或 `--root <dir>`、`--build <recipe>`、`--remove <pkg>`、`--deb <file>`、`--rpm <file>`、`--arch <file>`、`--config <file>`、`--mirrors <file>`、`--repo-dir <dir>`、`--cache <dir>`、`--key <gpg-key>`、`--allow-downgrade`、`--prefer-arch`、`--jobs <n>`、`--no-sandbox`、`--no-deps` 和 `--no-hooks`"
                 ))
             }
         }
@@ -705,6 +711,7 @@ fn parse_cli() -> Result<Cli, String> {
         cache,
         allow_downgrade,
         no_sandbox,
+        no_deps,
         jobs,
         init,
         build_world,
@@ -936,6 +943,7 @@ fn preflight_requirements(
 }
 
 /// 兼容轨道：解析 .pkg.tar.zst、暂存提取、ABI 校验后发布到目标 Rootfs。
+#[allow(clippy::too_many_arguments)]
 fn install_arch(
     db: &mut LocalDb,
     arch_path: &Path,
@@ -944,6 +952,7 @@ fn install_arch(
     installed: &[InstalledPackage],
     mapper: &DependencyMapper,
     no_hooks: bool,
+    no_deps: bool,
 ) -> Result<(), String> {
     let metadata = compat_arch::parse_arch_metadata(arch_path)?;
     println!("Arch 包: {} {}", metadata.pkgname, metadata.pkgver);
@@ -956,8 +965,12 @@ fn install_arch(
         }
     }
 
-    let requirements = metadata.mapped_requirements(mapper)?;
-    preflight_requirements(packages, installed, &requirements)?;
+    if no_deps {
+        println!("依赖预检: 跳过（--no-deps）");
+    } else {
+        let requirements = metadata.mapped_requirements(mapper)?;
+        preflight_requirements(packages, installed, &requirements)?;
+    }
 
     let hooks = compat_arch::read_arch_hooks(arch_path)?;
     let target = Rootfs::prepare(rootfs_path)?;

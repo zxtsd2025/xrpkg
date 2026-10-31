@@ -230,6 +230,7 @@ pub fn publish_files(staging: &Rootfs, target: &Rootfs, files: &[String]) -> Res
             if source_metadata.nlink() > 1 {
                 let key = (source_metadata.dev(), source_metadata.ino());
                 if let Some(origin) = hardlinks.get(&key) {
+                    ensure_hardlink_destination(&destination)?;
                     fs::hard_link(origin, &destination).map_err(|error| {
                         format!(
                             "发布硬链接 `{}` -> `{}` 失败: {error}",
@@ -263,13 +264,15 @@ pub fn publish_files(staging: &Rootfs, target: &Rootfs, files: &[String]) -> Res
     Ok(())
 }
 
-/// 检查发布目标，不跟随已有符号链接。
+/// 检查发布目标；旧符号链接会被删除，但绝不通过链接写入其目标。
 fn ensure_publish_destination(destination: &Path) -> Result<(), String> {
     match fs::symlink_metadata(destination) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
-            "目标文件 `{}` 是符号链接，拒绝覆盖",
-            destination.display()
-        )),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            // 只删除链接本身，随后在同一路径创建新文件/链接，链接目标不受影响。
+            fs::remove_file(destination).map_err(|error| {
+                format!("删除旧符号链接 `{}` 失败: {error}", destination.display())
+            })
+        }
         Ok(metadata) if metadata.is_dir() => {
             Err(format!("目标文件 `{}` 是目录", destination.display()))
         }
@@ -277,6 +280,27 @@ fn ensure_publish_destination(destination: &Path) -> Result<(), String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!(
             "检查目标文件 `{}` 失败: {error}",
+            destination.display()
+        )),
+    }
+}
+
+/// 硬链接发布前删除同名旧文件；目录仍然拒绝，避免误删目录树。
+fn ensure_hardlink_destination(destination: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.is_dir() => Err(format!(
+            "目标文件 `{}` 是目录，拒绝创建硬链接",
+            destination.display()
+        )),
+        Ok(_) => fs::remove_file(destination).map_err(|error| {
+            format!(
+                "删除硬链接目标旧文件 `{}` 失败: {error}",
+                destination.display()
+            )
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "检查硬链接目标 `{}` 失败: {error}",
             destination.display()
         )),
     }
@@ -492,59 +516,94 @@ pub(crate) fn validate_symlink_target(
     let canonical_root = fs::canonicalize(root)
         .map_err(|error| format!("规范化 Rootfs `{}` 失败: {error}", root.display()))?;
     let candidate = canonical_root.join(&resolved);
+    ensure_symlink_target_within(&canonical_root, &candidate, link_relative, target)
+}
 
-    match fs::symlink_metadata(&candidate) {
+/// 校验符号链接目标不会逃出 Rootfs；目标可以稍后由同一个包创建。
+fn ensure_symlink_target_within(
+    canonical_root: &Path,
+    candidate: &Path,
+    link_relative: &Path,
+    target: &Path,
+) -> Result<(), String> {
+    match fs::symlink_metadata(candidate) {
+        Ok(metadata) if metadata.file_type().is_symlink() => match fs::canonicalize(candidate) {
+            Ok(canonical) => ensure_within(canonical_root, &canonical, link_relative, target),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                ensure_existing_ancestor_within(canonical_root, candidate.parent(), link_relative)
+            }
+            Err(error) => Err(format!(
+                "解析符号链接目标 `{}` 失败: {error}",
+                candidate.display()
+            )),
+        },
         Ok(_) => {
-            let canonical = fs::canonicalize(&candidate).map_err(|error| {
+            let canonical = fs::canonicalize(candidate).map_err(|error| {
                 format!("解析符号链接目标 `{}` 失败: {error}", candidate.display())
             })?;
-            if !canonical.starts_with(&canonical_root) {
-                return Err(format!(
-                    "符号链接 `{}` 的目标 `{}` 解析到 Rootfs 外",
-                    link_relative.display(),
-                    target.display()
-                ));
-            }
+            ensure_within(canonical_root, &canonical, link_relative, target)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            // 目标可以稍后由同一个包创建；检查最近的已存在祖先是否仍在 Rootfs 内。
-            let mut ancestor = candidate.parent();
-            while let Some(path) = ancestor {
-                match fs::symlink_metadata(path) {
-                    Ok(_) => {
-                        let canonical = fs::canonicalize(path).map_err(|error| {
-                            format!("解析符号链接祖先 `{}` 失败: {error}", path.display())
-                        })?;
-                        if !canonical.starts_with(&canonical_root) {
-                            return Err(format!(
-                                "符号链接 `{}` 的目标祖先 `{}` 在 Rootfs 外",
-                                link_relative.display(),
-                                path.display()
-                            ));
-                        }
-                        break;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        ancestor = path.parent();
-                    }
-                    Err(error) => {
-                        return Err(format!(
-                            "检查符号链接目标祖先 `{}` 失败: {error}",
-                            path.display()
-                        ))
-                    }
+            // 悬空链接是合法的：只检查最近的已存在祖先是否仍在 Rootfs 内。
+            ensure_existing_ancestor_within(canonical_root, candidate.parent(), link_relative)
+        }
+        Err(error) => Err(format!(
+            "检查符号链接目标 `{}` 失败: {error}",
+            candidate.display()
+        )),
+    }
+}
+
+/// 从给定路径向上找到第一个存在的祖先，规范化后必须仍在 Rootfs 内。
+fn ensure_existing_ancestor_within(
+    canonical_root: &Path,
+    start: Option<&Path>,
+    link_relative: &Path,
+) -> Result<(), String> {
+    let mut ancestor = start;
+    while let Some(path) = ancestor {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {
+                let canonical = fs::canonicalize(path).map_err(|error| {
+                    format!("解析符号链接祖先 `{}` 失败: {error}", path.display())
+                })?;
+                if canonical.starts_with(canonical_root) {
+                    return Ok(());
                 }
+                return Err(format!(
+                    "符号链接 `{}` 的目标祖先 `{}` 在 Rootfs 外",
+                    link_relative.display(),
+                    path.display()
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => ancestor = path.parent(),
+            Err(error) => {
+                return Err(format!(
+                    "检查符号链接目标祖先 `{}` 失败: {error}",
+                    path.display()
+                ))
             }
         }
-        Err(error) => {
-            return Err(format!(
-                "检查符号链接目标 `{}` 失败: {error}",
-                candidate.display()
-            ))
-        }
     }
-
     Ok(())
+}
+
+/// 规范化后的目标路径必须仍在 Rootfs 内。
+fn ensure_within(
+    canonical_root: &Path,
+    canonical: &Path,
+    link_relative: &Path,
+    target: &Path,
+) -> Result<(), String> {
+    if canonical.starts_with(canonical_root) {
+        Ok(())
+    } else {
+        Err(format!(
+            "符号链接 `{}` 的目标 `{}` 解析到 Rootfs 外",
+            link_relative.display(),
+            target.display()
+        ))
+    }
 }
 
 /// 把链接所在目录与相对目标拼接，并做纯词法 `..` 归一化。

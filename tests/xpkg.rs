@@ -365,3 +365,112 @@ fn rejects_metadata_version_mismatch() {
 fn refuses_to_use_the_host_root_as_rootfs() {
     assert!(Rootfs::prepare("/").is_err());
 }
+
+#[test]
+fn publish_replaces_symlinks_without_following_them() {
+    use xrpkg::xpkg::publish_files;
+
+    let temp = TempDir::new().unwrap();
+    let staging = Rootfs::prepare(temp.path().join("staging")).unwrap();
+    let target = Rootfs::prepare(temp.path().join("rootfs")).unwrap();
+
+    fs::create_dir_all(staging.path().join("usr/bin")).unwrap();
+    fs::create_dir_all(staging.path().join("usr/lib")).unwrap();
+    fs::write(staging.path().join("usr/bin/foo"), b"new-bin").unwrap();
+    fs::write(staging.path().join("usr/lib/libfoo.so.1.0"), b"new-lib").unwrap();
+    std::os::unix::fs::symlink("libfoo.so.1.0", staging.path().join("usr/lib/libfoo.so")).unwrap();
+
+    fs::create_dir_all(target.path().join("usr/bin")).unwrap();
+    fs::create_dir_all(target.path().join("usr/lib")).unwrap();
+    fs::write(target.path().join("usr/bin/sentinel"), b"SENTINEL").unwrap();
+    fs::write(target.path().join("usr/lib/sentinel"), b"SENTINEL").unwrap();
+    std::os::unix::fs::symlink("../sentinel", target.path().join("usr/bin/foo")).unwrap();
+    std::os::unix::fs::symlink("sentinel", target.path().join("usr/lib/libfoo.so")).unwrap();
+
+    publish_files(
+        &staging,
+        &target,
+        &[
+            "usr/bin/foo".to_string(),
+            "usr/lib/libfoo.so".to_string(),
+            "usr/lib/libfoo.so.1.0".to_string(),
+        ],
+    )
+    .unwrap();
+
+    // 普通文件覆盖旧符号链接：新文件必须是普通文件，链接目标不得被改写。
+    assert_eq!(
+        fs::read(target.path().join("usr/bin/foo")).unwrap(),
+        b"new-bin"
+    );
+    assert_eq!(
+        fs::read(target.path().join("usr/bin/sentinel")).unwrap(),
+        b"SENTINEL"
+    );
+    // 符号链接覆盖旧符号链接：换成新链接，旧链接目标不得被改写。
+    assert_eq!(
+        fs::read_link(target.path().join("usr/lib/libfoo.so")).unwrap(),
+        Path::new("libfoo.so.1.0")
+    );
+    assert_eq!(
+        fs::read(target.path().join("usr/lib/sentinel")).unwrap(),
+        b"SENTINEL"
+    );
+    assert_eq!(
+        fs::read(target.path().join("usr/lib/libfoo.so.1.0")).unwrap(),
+        b"new-lib"
+    );
+}
+
+#[test]
+fn publish_replaces_existing_file_with_hardlink() {
+    use std::os::unix::fs::MetadataExt;
+    use xrpkg::xpkg::publish_files;
+
+    let temp = TempDir::new().unwrap();
+    let staging = Rootfs::prepare(temp.path().join("staging")).unwrap();
+    let target = Rootfs::prepare(temp.path().join("rootfs")).unwrap();
+
+    fs::create_dir_all(staging.path().join("usr/bin")).unwrap();
+    fs::write(staging.path().join("usr/bin/a"), b"hardlinked").unwrap();
+    fs::hard_link(
+        staging.path().join("usr/bin/a"),
+        staging.path().join("usr/bin/b"),
+    )
+    .unwrap();
+
+    fs::create_dir_all(target.path().join("usr/bin")).unwrap();
+    fs::write(target.path().join("usr/bin/b"), b"old").unwrap();
+
+    publish_files(
+        &staging,
+        &target,
+        &["usr/bin/a".to_string(), "usr/bin/b".to_string()],
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::read(target.path().join("usr/bin/b")).unwrap(),
+        b"hardlinked"
+    );
+    assert_eq!(
+        fs::metadata(target.path().join("usr/bin/a")).unwrap().ino(),
+        fs::metadata(target.path().join("usr/bin/b")).unwrap().ino()
+    );
+}
+
+#[test]
+fn allows_dangling_symlink_target_for_later_package_files() {
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("dangling.xpkg");
+    write_symlink_xpkg(&archive, "libfoo.so.1");
+    let rootfs = Rootfs::prepare(temp.path().join("rootfs")).unwrap();
+
+    let installed = install_package(&archive, &selected("app", "1.0"), &rootfs).unwrap();
+
+    assert_eq!(installed, ["link"]);
+    assert_eq!(
+        fs::read_link(rootfs.path().join("link")).unwrap(),
+        Path::new("libfoo.so.1")
+    );
+}

@@ -7,14 +7,14 @@ source = [
 requires = []
 
 build = [
-  "cd linux-6.7.4 && make mrproper && make defconfig && scripts/config --disable WERROR --disable DEBUG_INFO_BTF --enable BLK_DEV_NVME --enable EXT4_FS --enable EFI --enable FB --enable FB_EFI --enable FAT_FS --enable VFAT_FS --enable DEVTMPFS --enable DEVTMPFS_MOUNT && make olddefconfig",
-  "cd linux-6.7.4 && grep -qx \"CONFIG_BLK_DEV_NVME=y\" .config && grep -qx \"CONFIG_EXT4_FS=y\" .config && grep -qx \"CONFIG_EFI=y\" .config && grep -qx \"CONFIG_FB_EFI=y\" .config && grep -qx \"CONFIG_VFAT_FS=y\" .config && grep -qx \"CONFIG_DEVTMPFS=y\" .config && grep -qx \"CONFIG_DEVTMPFS_MOUNT=y\" .config",
+  "cd linux-6.7.4 && make mrproper && make defconfig && scripts/config --disable WERROR --disable DEBUG_INFO_BTF --enable BLK_DEV_NVME --enable EXT4_FS --enable EFI --enable FB --enable FB_EFI --enable FB_VESA --enable FRAMEBUFFER_CONSOLE --enable FAT_FS --enable VFAT_FS --enable DEVTMPFS --enable DEVTMPFS_MOUNT --enable DRM --enable DRM_FBDEV_EMULATION --enable DRM_VBOXVIDEO --enable DRM_VMWGFX && make olddefconfig",
+  "cd linux-6.7.4 && grep -qx \"CONFIG_BLK_DEV_NVME=y\" .config && grep -qx \"CONFIG_EXT4_FS=y\" .config && grep -qx \"CONFIG_EFI=y\" .config && grep -qx \"CONFIG_FB_EFI=y\" .config && grep -qx \"CONFIG_VFAT_FS=y\" .config && grep -qx \"CONFIG_DEVTMPFS=y\" .config && grep -qx \"CONFIG_DEVTMPFS_MOUNT=y\" .config && grep -qx \"CONFIG_DRM=y\" .config && grep -qx \"CONFIG_DRM_VBOXVIDEO=y\" .config && grep -qx \"CONFIG_DRM_VMWGFX=y\" .config",
   "cd linux-6.7.4 && make CC=\"gcc -std=gnu11\" HOSTCC=\"gcc -std=gnu11\" KCFLAGS=\"-std=gnu11\"",
 ]
 
 package = [
   "mkdir -p \"$PKGDIR/boot\"",
-  "cd linux-6.7.4 && make INSTALL_MOD_PATH=\"$PKGDIR\" modules_install && rm -f \"$PKGDIR/lib/modules/6.7.4/build\" \"$PKGDIR/lib/modules/6.7.4/source\"",
+  "cd linux-6.7.4 && make INSTALL_MOD_PATH=\"$PKGDIR/usr\" modules_install && rm -f \"$PKGDIR/usr/lib/modules/6.7.4/build\" \"$PKGDIR/usr/lib/modules/6.7.4/source\"",
   "cd linux-6.7.4 && make INSTALL_PATH=\"$PKGDIR/boot\" install",
   "cd linux-6.7.4 && install -Dm644 arch/x86/boot/bzImage \"$PKGDIR/boot/bzImage\"",
 ]

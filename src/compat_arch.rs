@@ -8,10 +8,13 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
+use crate::abi::AbiGuard;
 use crate::capability::Capability;
 use crate::deps_map::DependencyMapper;
 use crate::hooks::{HookScript, POST_INSTALL, POST_REMOVE, PRE_INSTALL, PRE_REMOVE};
-use crate::xpkg::{ensure_directory, sanitize_relative, write_file, Rootfs};
+use crate::xpkg::{
+    create_hard_link, create_symlink, ensure_directory, sanitize_relative, write_file, Rootfs,
+};
 
 /// 本模块使用的错误类型；当前统一用可读字符串。
 pub type Error = String;
@@ -92,6 +95,68 @@ pub fn parse_arch_metadata(arch_path: &Path) -> Result<ArchMetadata, Error> {
     parse_pkg_info(decoder)
 }
 
+/// 直接在内存中扫描 Arch 包内的 ELF，交给 ABI 守门员检查。
+///
+/// 只检查普通文件；目录、符号链接和根目录点元数据都跳过。这样同步仓库时
+/// 不需要把整个包解包到文件系统，也不会因为符号链接而误判。
+pub fn verify_arch_abi(
+    arch_path: &Path,
+    package_name: &str,
+    guard: &AbiGuard,
+) -> Result<(), Error> {
+    let file = File::open(arch_path)
+        .map_err(|error| format!("打开 Arch 包 `{}` 失败: {error}", arch_path.display()))?;
+    let decoder = zstd::stream::read::Decoder::new(file)
+        .map_err(|error| format!("创建 ZSTD 解码器失败: {error}"))?;
+    let mut archive = tar::Archive::new(decoder);
+
+    for entry in archive
+        .entries()
+        .map_err(|error| format!("读取 Arch TAR 目录失败: {error}"))?
+    {
+        let mut entry = entry.map_err(|error| format!("读取 Arch TAR 条目失败: {error}"))?;
+        let path = entry
+            .path()
+            .map_err(|error| format!("读取 Arch TAR 条目路径失败: {error}"))?
+            .into_owned();
+        let normalized = normalize_entry_path(&path);
+
+        if is_root_dot_metadata(&normalized) || !entry.header().entry_type().is_file() {
+            continue;
+        }
+        if normalized.as_os_str().is_empty() {
+            continue;
+        }
+        let relative = sanitize_relative(&normalized)
+            .map_err(|error| format!("Arch 包路径 `{}` 非法: {error}", path.display()))?;
+
+        let mut magic = [0u8; 4];
+        let mut filled = 0;
+        while filled < magic.len() {
+            let count = entry.read(&mut magic[filled..]).map_err(|error| {
+                format!("读取 Arch TAR 条目 `{}` 失败: {error}", path.display())
+            })?;
+            if count == 0 {
+                break;
+            }
+            filled += count;
+        }
+        if filled < magic.len() || &magic != b"\x7fELF" {
+            continue;
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&magic);
+        entry
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("读取 Arch ELF `{}` 失败: {error}", path.display()))?;
+        let relative_text = relative.to_string_lossy().replace('\\', "/");
+        guard.check_bytes(package_name, &relative_text, &bytes)?;
+    }
+
+    Ok(())
+}
+
 /// 安全解包 Arch tar.zst 到 target_rootfs，跳过根目录点文件元数据。
 pub fn extract_arch_data(arch_path: &Path, target_rootfs: &Path) -> Result<Vec<PathBuf>, Error> {
     let file = File::open(arch_path)
@@ -143,14 +208,32 @@ pub fn extract_arch_data(arch_path: &Path, target_rootfs: &Path) -> Result<Vec<P
             let mode = entry.header().mode().unwrap_or(0o644);
             write_file(rootfs.path(), &relative, &mut entry, size, mode)?;
             installed.insert(relative);
-        } else if entry_type.is_symlink() {
-            return Err(format!(
-                "拒绝 Arch 包中的符号链接 `{}`，防止链接逃逸 Rootfs",
-                path.display()
-            ));
+        } else if entry_type == tar::EntryType::Symlink {
+            let link_target = entry
+                .link_name()
+                .map_err(|error| format!("读取符号链接目标 `{}` 失败: {error}", path.display()))?
+                .ok_or_else(|| format!("符号链接 `{}` 缺少目标", path.display()))?;
+            create_symlink(rootfs.path(), &relative, link_target.as_ref())?;
+            installed.insert(relative);
+        } else if entry_type == tar::EntryType::Link {
+            let link_name = entry
+                .link_name()
+                .map_err(|error| format!("读取硬链接目标 `{}` 失败: {error}", path.display()))?
+                .ok_or_else(|| format!("硬链接 `{}` 缺少目标", path.display()))?;
+            let link_relative = sanitize_relative(&normalize_entry_path(&link_name))
+                .map_err(|error| format!("硬链接目标 `{}` 非法: {error}", link_name.display()))?;
+            if !seen_paths.contains(&link_relative) {
+                return Err(format!(
+                    "硬链接 `{}` 的目标 `{}` 尚未安装",
+                    path.display(),
+                    link_name.display()
+                ));
+            }
+            create_hard_link(rootfs.path(), &relative, &link_relative)?;
+            installed.insert(relative);
         } else {
             return Err(format!(
-                "拒绝 Arch 包中的非普通文件/目录条目 `{}`",
+                "拒绝 Arch 包中的非普通文件/目录/链接条目 `{}`",
                 path.display()
             ));
         }

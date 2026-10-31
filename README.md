@@ -12,7 +12,7 @@
 
 The project currently targets the **LFS 12.1 baseline**: glibc 2.44, x86_64, and a modern LFS userspace.
 
-> **Status:** experimental, phase 22. The core install/upgrade/sign/build flows are tested, but this is not yet a production package manager.
+> **Status:** experimental, phase 30. Native/compat install, Arch sync, concurrent downloads, repository signing, and build flows are tested, but this is not yet a production package manager.
 
 ### Highlights
 
@@ -40,26 +40,67 @@ The project currently targets the **LFS 12.1 baseline**: glibc 2.44, x86_64, and
 - **Isolated build sandbox**  
   Build and package steps run in a user/mount namespace with a read-only `/usr`, private `/tmp`, and bound source/output directories.
 
+- **Arch repository sync and compatibility install**  
+  Parse a Pacman `core.db`, download `.pkg.tar.zst` files concurrently, run the ABI guard, and install `origin = "arch"` packages through the compatibility track.
+
+- **Concurrent downloads with colored progress bars**  
+  Per-package bars show speed, bytes, percentage, and ETA; they hide automatically when stderr is not a TTY.
+
 - **LFS recipes**  
   Reference recipes for `hello`, `zlib`, `binutils`, `glibc`, `gcc`, `linux`, `bash`, and `coreutils`.
 
 ### Requirements
 
 - Linux with user namespaces and `unshare`
-- Rust 2021 toolchain
+- Rust 2021 toolchain (tested with 1.99)
+- C toolchain (`cc`, `make`) for bundled SQLite/zstd/xz
 - `gpg` for repository signatures
+- `tar`, `gzip`, and `zstd` for compatibility and sync workflows
 - `sudo` only for optional chroot/device-node experiments
 
-Build the binary:
+Build and verify:
 
 ```sh
 cargo build --release
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
 ```
 
 Install the binary somewhere on `PATH`:
 
 ```sh
 install -Dm755 target/release/xrpkg ~/.local/bin/xrpkg
+# or system-wide
+sudo install -Dm755 target/release/xrpkg /usr/local/bin/xrpkg
+```
+
+After configuring `config/mirrors.toml`, the release binary can be smoke-tested with:
+
+```sh
+xrpkg sync --all --jobs 4
+```
+
+For a copy-paste agent handoff, see [docs/AGENT_COMPILE_INSTALL_PROMPT.md](docs/AGENT_COMPILE_INSTALL_PROMPT.md).
+
+### Disk usage
+
+`cargo test` compiles debug dependencies and test binaries under `target/debug`; a full run can use several GB (debug info and incremental artifacts). For reference, a full debug test build in this workspace used about **6.9 GiB**, while `target/release` was about **444 MiB**. The installed `xrpkg` binary itself is only **9.7 MiB**.
+
+After installing the release binary, reclaim space with:
+
+```sh
+# keep target/release, remove debug/test artifacts
+rm -rf target/debug
+
+# or remove all Cargo artifacts (also deletes target/release/xrpkg)
+cargo clean
+```
+
+For disk-constrained CI, disable debug info and incremental compilation:
+
+```sh
+CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo test
 ```
 
 ### Quick start
@@ -203,6 +244,43 @@ xrpkg install ./package.pkg.tar.zst
 
 Debian, RPM, and Arch metadata are parsed, dependencies are mapped through `config/deps_map.toml`, and the resulting files and hooks are recorded in the native SQLite database. External packages are not converted into `.xpkg`.
 
+### Arch repository sync and installation
+
+Configure one or more Arch repository directories in `config/mirrors.toml`:
+
+```toml
+[[mirrors]]
+name = "tuna"
+url = "https://mirrors.tuna.tsinghua.edu.cn/archlinux/core/os/x86_64/"
+priority = 1
+```
+
+Sync all configured mirrors, a named mirror, or a direct URL:
+
+```sh
+xrpkg sync --all
+xrpkg sync tuna
+xrpkg sync https://mirrors.ustc.edu.cn/archlinux/core/os/x86_64/
+```
+
+`sync` downloads `.pkg.tar.zst` files concurrently, checks SHA256, runs the ABI guard, and indexes accepted packages with `origin = "arch"`. `--jobs <n>` controls the download worker count. Progress bars are colored and only drawn when stderr is a terminal; in scripts and CI they are hidden automatically.
+
+A synced Arch package is installed through the compatibility track:
+
+```sh
+xrpkg install acl
+```
+
+Native `.xpkg` candidates win when both tracks provide the same name. Use `--prefer-arch` to force the Arch package. `xrpkg install` downloads the `.pkg.tar.zst` from the configured mirrors, runs the ABI guard, publishes files and symlinks, and records `origin = "arch"` in SQLite.
+
+`--jobs <n>` also controls sync concurrency; the default is `min(available_parallelism, 8)`. `--repo-dir <dir>` overrides the default `repo/` destination. `sync` refreshes the local repository only; the existing signature policy is unchanged. Sign the index before `xrpkg update`:
+
+```sh
+xrpkg repo-sign <KEY_ID> repo/xrpkg-repo.toml
+xrpkg update --config ~/.config/xrpkg/repos.toml
+xrpkg install acl
+```
+
 ### Upgrade and downgrade
 
 Install or upgrade to the newest repository version:
@@ -265,6 +343,9 @@ src/
   installer.rs   staging, ABI checks, upgrade transactions
   hooks.rs       lifecycle hooks and hook sandbox
   repo.rs        repository indexes, cache, downloads, cleanup
+  download.rs    streaming HTTP/local downloads and progress bars
+  mirrors.rs     config/mirrors.toml loading and priority resolution
+  sync.rs        Arch core.db sync and parallel ingest
   sign.rs        OpenPGP detached signatures
   state.rs       SQLite state
   solver.rs      selected-package type
@@ -272,7 +353,7 @@ src/
   xpkg.rs        .xpkg writer/reader and safe extraction
   compat_*.rs    deb/rpm/arch compatibility tracks
 recipes/         LFS build recipes
-config/          repository configuration and deps map
+config/          repository config, deps map, and mirrors.toml
 tests/           integration tests
 repo/            built package artifacts (ignored)
 var/             local SQLite state (ignored)
@@ -299,7 +380,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Current local result: **114 tests passed**. Some tests require `unshare`, user namespaces, and `gpg`.
+Current local result: **131 tests passed across 27 test targets**. Some tests require `unshare`, user namespaces, `gpg`, and `zstd`.
 
 ### Security model and scope
 
@@ -319,6 +400,8 @@ The build sandbox isolates mounts and the filesystem view, but it is not a virtu
 - Not production-ready.
 - LFS glibc/gcc recipes are present and configure-verified; full toolchain builds are long and hardware-dependent.
 - Compat tracks record external packages in the native database, but do not rewrite their dependency metadata.
+- `sync` does not sign the repository automatically; the existing `repo-sign` step is still required before `xrpkg update`.
+- Only the Arch/Pacman ecosystem is synced in this phase; apt/dnf are not implemented.
 - Repository signatures depend on a system `gpg` installation.
 
 [中文](#zh)
@@ -337,7 +420,7 @@ The build sandbox isolates mounts and the filesystem view, but it is not a virtu
 
 当前目标基线为 **LFS 12.1**：glibc 2.44、x86_64、现代 LFS 用户态。
 
-> **状态：** 实验性，阶段 22。安装、升级、签名、构建等核心流程已有测试，但还不是生产级包管理器。
+> **状态：** 实验性，阶段 30。原生/兼容安装、Arch 同步、并发下载、仓库签名和构建流程已有测试，但还不是生产级包管理器。
 
 ### 主要特性
 
@@ -349,25 +432,62 @@ The build sandbox isolates mounts and the filesystem view, but it is not a virtu
 - **升级与显式降级**：备份旧文件、清理废弃文件，失败时回滚。
 - **OpenPGP 仓库签名**：索引和包使用分离 `.sig`，按显式信任 keyring 验证。
 - **隔离构建沙箱**：user/mount namespace、只读 `/usr`、独立 `/tmp`、绑定源码和输出目录。
+- **Arch 仓库同步与兼容安装**：解析 Pacman `core.db`，并发下载 `.pkg.tar.zst`，通过 ABI 守门后按 `origin = "arch"` 走兼容轨道安装。
+- **并发下载与彩色进度条**：每个包显示速度、字节数、百分比和 ETA；stderr 不是终端时自动隐藏。
 - **LFS 配方**：`hello`、`zlib`、`binutils`、`glibc`、`gcc`、`linux`、`bash`、`coreutils`。
 
 ### 环境要求
 
 - Linux，支持 user namespace 和 `unshare`
-- Rust 2021 工具链
+- Rust 2021 工具链（已在 1.99 上验证）
+- C 工具链（`cc`、`make`），用于 bundled SQLite/zstd/xz
 - 仓库签名需要 `gpg`
+- 兼容/同步流程需要 `tar`、`gzip`、`zstd`
 - 只有可选的 chroot/设备节点实验需要 `sudo`
 
-构建：
+构建并验证：
 
 ```sh
 cargo build --release
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
 ```
 
 安装到 `PATH`：
 
 ```sh
 install -Dm755 target/release/xrpkg ~/.local/bin/xrpkg
+# 或系统级
+sudo install -Dm755 target/release/xrpkg /usr/local/bin/xrpkg
+```
+
+配置好 `config/mirrors.toml` 后，可用 release 二进制做一次同步冒烟测试：
+
+```sh
+xrpkg sync --all --jobs 4
+```
+
+自动化编译/安装交接提示词见 [docs/AGENT_COMPILE_INSTALL_PROMPT.md](docs/AGENT_COMPILE_INSTALL_PROMPT.md)。
+
+### 磁盘占用
+
+`cargo test` 会在 `target/debug` 下编译 debug 依赖和测试二进制，完整跑一遍可能达到数 GB（调试信息和增量产物）。本工作区实测：`target/debug` 约 **6.9 GiB**，`target/release` 约 **444 MiB**；真正安装的 `xrpkg` 二进制只有 **9.7 MiB**。
+
+安装 release 二进制后，可以这样释放空间：
+
+```sh
+# 保留 target/release，删除 debug/测试产物
+rm -rf target/debug
+
+# 或删除全部 Cargo 产物（会同时删掉 target/release/xrpkg）
+cargo clean
+```
+
+磁盘受限的 CI 可以关闭调试信息和增量编译：
+
+```sh
+CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo test
 ```
 
 ### 快速开始
@@ -511,6 +631,43 @@ xrpkg install ./package.pkg.tar.zst
 
 解析 Debian、RPM、Arch 元数据，通过 `config/deps_map.toml` 映射依赖，并把文件与 hooks 记录到 native SQLite 数据库。外部包不会被转换成 `.xpkg`。
 
+### Arch 仓库同步与安装
+
+在 `config/mirrors.toml` 中配置一个或多个 Arch 仓库目录：
+
+```toml
+[[mirrors]]
+name = "tuna"
+url = "https://mirrors.tuna.tsinghua.edu.cn/archlinux/core/os/x86_64/"
+priority = 1
+```
+
+同步全部镜像、指定镜像或直接 URL：
+
+```sh
+xrpkg sync --all
+xrpkg sync tuna
+xrpkg sync https://mirrors.ustc.edu.cn/archlinux/core/os/x86_64/
+```
+
+`sync` 会并发下载 `.pkg.tar.zst`，校验 SHA256，运行 ABI 守门，并把通过的包以 `origin = "arch"` 写入本地索引。`--jobs <n>` 控制下载线程数，默认是 `min(available_parallelism, 8)`；`--repo-dir <dir>` 可覆盖默认的 `repo/` 输出目录。stderr 不是终端时进度条自动隐藏，不污染 CI 日志。
+
+安装已同步的 Arch 包：
+
+```sh
+xrpkg install acl
+```
+
+同名原生 `.xpkg` 默认优先；`--prefer-arch` 强制使用 Arch 包。`install` 会从镜像下载 `.pkg.tar.zst`，运行 ABI 守门，发布普通文件和符号链接，并在 SQLite 中记录 `origin = "arch"`。
+
+`sync` 只更新本地索引，不改变签名策略。仍需先用 `xrpkg repo-sign` 签索引，再执行 `xrpkg update`/`install`：
+
+```sh
+xrpkg repo-sign <KEY_ID> repo/xrpkg-repo.toml
+xrpkg update --config ~/.config/xrpkg/repos.toml
+xrpkg install acl
+```
+
 ### 升级与降级
 
 安装或升级到仓库最新版：
@@ -573,6 +730,9 @@ src/
   installer.rs   暂存、ABI 校验、升级事务
   hooks.rs       生命周期 hooks 与 hook 沙箱
   repo.rs        仓库索引、缓存、下载、清理
+  download.rs    统一下载与进度条
+  mirrors.rs     config/mirrors.toml 加载与优先级解析
+  sync.rs        Arch core.db 同步与并发入库
   sign.rs        OpenPGP 分离签名
   state.rs       SQLite 状态
   solver.rs      已选包类型
@@ -580,7 +740,7 @@ src/
   xpkg.rs        .xpkg 读写与安全解包
   compat_*.rs    deb/rpm/arch 兼容轨道
 recipes/         LFS 构建配方
-config/          仓库配置与依赖映射
+config/          仓库配置、依赖映射与 mirrors.toml
 tests/           集成测试
 repo/            构建产物（已忽略）
 var/             本地 SQLite 状态（已忽略）
@@ -607,7 +767,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-当前本地结果：**114 个测试通过**。部分测试需要 `unshare`、user namespace 和 `gpg`。
+当前本地结果：**27 个测试目标、131 个测试通过**。部分测试需要 `unshare`、user namespace、`gpg` 和 `zstd`。
 
 ### 安全模型与边界
 
@@ -627,6 +787,8 @@ cargo fmt --check
 - 尚未达到生产级。
 - LFS glibc/gcc 配方已包含并验证 configure；完整工具链构建耗时长且依赖硬件。
 - 兼容轨道会把外部包记录到 native 数据库，但不会重写其依赖元数据。
+- `sync` 不会自动签名仓库；执行 `xrpkg update` 前仍需走既有 `repo-sign` 流程。
+- 本阶段只同步 Arch/Pacman 生态，尚未实现 apt/dnf。
 - 仓库签名依赖系统 `gpg`。
 
 [English](#english)

@@ -40,7 +40,34 @@ impl AbiGuard {
         relative_path: &str,
         staged_file: &Path,
     ) -> Result<(), String> {
-        let Some(required) = inspect_elf(staged_file)? else {
+        self.check_required(package_name, relative_path, inspect_elf(staged_file)?)
+    }
+
+    /// 检查一段已经读入内存的 ELF 字节；非 ELF 内容直接放行。
+    ///
+    /// 用于无法或不需要先落盘的场景，例如同步仓库时直接扫描 `.pkg.tar.zst`
+    /// 内的条目。
+    pub fn check_bytes(
+        &self,
+        package_name: &str,
+        relative_path: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        self.check_required(
+            package_name,
+            relative_path,
+            inspect_elf_bytes(bytes, relative_path)?,
+        )
+    }
+
+    /// 比较已解析出的最高 GLIBC 需求与基线。
+    fn check_required(
+        &self,
+        package_name: &str,
+        relative_path: &str,
+        required: Option<Version>,
+    ) -> Result<(), String> {
+        let Some(required) = required else {
             return Ok(());
         };
 
@@ -63,13 +90,16 @@ impl AbiGuard {
 pub fn inspect_elf(path: &Path) -> Result<Option<Version>, String> {
     let bytes = fs::read(path)
         .map_err(|error| format!("读取 ELF 文件 `{}` 失败: {error}", path.display()))?;
+    inspect_elf_bytes(&bytes, &format!("文件 `{}`", path.display()))
+}
 
+/// 解析内存中的 ELF 字节；`label` 只用于错误信息。
+fn inspect_elf_bytes(bytes: &[u8], label: &str) -> Result<Option<Version>, String> {
     if !bytes.starts_with(b"\x7fELF") {
         return Ok(None);
     }
 
-    let elf = Elf::parse(&bytes)
-        .map_err(|error| format!("解析 ELF 文件 `{}` 失败: {error}", path.display()))?;
+    let elf = Elf::parse(bytes).map_err(|error| format!("解析 ELF {label} 失败: {error}"))?;
 
     let mut highest = None;
     if let Some(verneed) = &elf.verneed {

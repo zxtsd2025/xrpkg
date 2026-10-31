@@ -412,7 +412,7 @@ fn extract_files(archive: &Path, rootfs: &Rootfs) -> Result<Vec<String>, String>
 }
 
 /// 创建一个安全的相对符号链接。
-fn create_symlink(root: &Path, relative: &Path, target: &Path) -> Result<(), String> {
+pub(crate) fn create_symlink(root: &Path, relative: &Path, target: &Path) -> Result<(), String> {
     validate_symlink_target(root, relative, target)?;
     if let Some(parent) = relative.parent() {
         if !parent.as_os_str().is_empty() {
@@ -440,7 +440,11 @@ fn create_symlink(root: &Path, relative: &Path, target: &Path) -> Result<(), Str
 }
 
 /// 创建一个指向 Rootfs 内普通文件的硬链接。
-fn create_hard_link(root: &Path, relative: &Path, target_relative: &Path) -> Result<(), String> {
+pub(crate) fn create_hard_link(
+    root: &Path,
+    relative: &Path,
+    target_relative: &Path,
+) -> Result<(), String> {
     let target = root.join(target_relative);
     let metadata = fs::symlink_metadata(&target)
         .map_err(|error| format!("读取硬链接目标 `{}` 失败: {error}", target.display()))?;

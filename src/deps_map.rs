@@ -62,17 +62,41 @@ impl DependencyMapper {
     ///
     /// 命中时返回映射值；未命中时原样返回，并打印 warning。
     pub fn map_dependency(&self, external_cap: &str) -> String {
-        if let Some(mapped) = self.lookup(external_cap) {
-            mapped.to_string()
-        } else {
-            eprintln!("warning: 外部依赖 `{external_cap}` 没有映射，保留原依赖名");
-            external_cap.to_string()
-        }
+        self.map_dependency_inner(external_cap, true)
     }
 
     /// 把外部依赖转换成内部 Capability；非法映射会回退到源包名。
     pub fn map_capability(&self, external_cap: &str) -> Result<Capability, Error> {
-        let mapped = self.map_dependency(external_cap);
+        self.map_capability_inner(external_cap, true)
+    }
+
+    /// 与 [`Self::map_capability`] 相同，但对“没有映射”保持安静。
+    ///
+    /// 同步整个外部仓库时，绝大多数依赖都不会出现在映射表里；逐条打印
+    /// warning 只会淹没真正重要的跳过原因。
+    pub fn map_capability_quiet(&self, external_cap: &str) -> Result<Capability, Error> {
+        self.map_capability_inner(external_cap, false)
+    }
+
+    /// 返回映射值；`warn_unmapped` 控制未命中时是否打印 warning。
+    fn map_dependency_inner(&self, external_cap: &str, warn_unmapped: bool) -> String {
+        if let Some(mapped) = self.lookup(external_cap) {
+            mapped.to_string()
+        } else {
+            if warn_unmapped {
+                eprintln!("warning: 外部依赖 `{external_cap}` 没有映射，保留原依赖名");
+            }
+            external_cap.to_string()
+        }
+    }
+
+    /// 把映射结果解析为 Capability；非法映射仍会打印配置错误 warning。
+    fn map_capability_inner(
+        &self,
+        external_cap: &str,
+        warn_unmapped: bool,
+    ) -> Result<Capability, Error> {
+        let mapped = self.map_dependency_inner(external_cap, warn_unmapped);
         match Capability::parse(&mapped) {
             Ok(capability) => Ok(capability),
             Err(error) => {

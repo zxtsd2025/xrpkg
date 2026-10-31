@@ -15,11 +15,13 @@ use xrpkg::deps_map::{default_config_path, DependencyMapper};
 use xrpkg::hooks::{self, HookScript, POST_INSTALL, PRE_INSTALL};
 use xrpkg::installer;
 use xrpkg::metadata::load_repository;
+use xrpkg::mirrors;
 use xrpkg::repo;
 use xrpkg::resolvo_solver::{self, incremental_plan};
 use xrpkg::sign;
 use xrpkg::solver::{Package, SelectedPackage};
 use xrpkg::state::{InstalledPackage, LocalDb, PackageInstall};
+use xrpkg::sync;
 use xrpkg::uninstall;
 use xrpkg::xpkg::{self, Rootfs};
 
@@ -51,6 +53,11 @@ struct Cli {
     clean: bool,
     search: Option<String>,
     install: Option<String>,
+    sync: Option<String>,
+    sync_all: bool,
+    prefer_arch: bool,
+    mirrors: Option<PathBuf>,
+    repo_dir: Option<PathBuf>,
     config: Option<PathBuf>,
     no_hooks: bool,
     db: Option<PathBuf>,
@@ -173,6 +180,13 @@ fn resolve_config_path(cli: &Cli) -> Result<PathBuf, String> {
     }
 }
 
+/// 返回 `--mirrors` 指定的镜像配置，否则使用项目内 config/mirrors.toml。
+fn resolve_mirrors_path(project_root: &Path, cli: &Cli) -> PathBuf {
+    cli.mirrors
+        .clone()
+        .unwrap_or_else(|| mirrors::default_config_path(project_root))
+}
+
 /// 加载仓库、解析参数，然后进入原生轨道或兼容轨道。
 fn run() -> Result<(), String> {
     let project_root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -190,9 +204,38 @@ fn run() -> Result<(), String> {
         + usize::from(cli.clean)
         + usize::from(cli.init)
         + usize::from(cli.search.is_some())
-        + usize::from(cli.install.is_some());
+        + usize::from(cli.install.is_some())
+        + usize::from(cli.sync.is_some())
+        + usize::from(cli.sync_all);
     if action_count > 1 {
-        return Err("构建、卸载、仓库和兼容轨道操作只能选择一个".to_string());
+        return Err("构建、卸载、仓库、同步和兼容轨道操作只能选择一个".to_string());
+    }
+
+    if cli.sync_all || cli.sync.is_some() {
+        let mirrors_path = resolve_mirrors_path(project_root, &cli);
+        let options = sync::SyncOptions {
+            jobs: cli.jobs.unwrap_or_else(sync::default_jobs),
+        };
+        let repo_dir = cli
+            .repo_dir
+            .clone()
+            .unwrap_or_else(|| project_root.join("repo"));
+        let deps_map = default_config_path(project_root);
+        if cli.sync_all {
+            for mirror in mirrors::load(&mirrors_path)? {
+                println!("==> 同步镜像 {}: {}", mirror.name, mirror.url);
+                sync::sync_mirror_with_options(&mirror.url, &repo_dir, &deps_map, &options)?;
+            }
+        } else if let Some(target) = &cli.sync {
+            let url = if mirrors::is_direct_location(target) {
+                target.clone()
+            } else {
+                mirrors::resolve_target(&mirrors::load(&mirrors_path)?, target)?
+            };
+            println!("==> 同步镜像: {url}");
+            sync::sync_mirror_with_options(&url, &repo_dir, &deps_map, &options)?;
+        }
+        return Ok(());
     }
 
     if let Some((key_id, file)) = &cli.repo_sign {
@@ -302,7 +345,8 @@ fn run() -> Result<(), String> {
         let config_path = resolve_config_path(&cli)?;
         let mut db = LocalDb::open(database_path(project_root, &cli))?;
         let (requested, requested_version) = parse_install_request(package_name)?;
-        repo::install_from_repositories(
+        let mirrors_path = resolve_mirrors_path(project_root, &cli);
+        let outcome = repo::install_from_repositories_with_mirrors(
             &mut db,
             &config_path,
             &cache_dir,
@@ -311,7 +355,29 @@ fn run() -> Result<(), String> {
             cli.allow_downgrade,
             &cli.rootfs,
             cli.no_hooks,
+            Some(&mirrors_path),
+            cli.prefer_arch,
         )?;
+        if let repo::RepositoryInstall::Arch(download) = outcome {
+            let packages = load_repository(project_root.join("packages.toml"))?;
+            let installed = db.list_installed()?;
+            let mapper = DependencyMapper::load_or_create(default_config_path(project_root))?;
+            println!(
+                "Arch 兼容包: {} {} ({})",
+                download.name,
+                download.version,
+                download.path.display()
+            );
+            install_arch(
+                &mut db,
+                &download.path,
+                &cli.rootfs,
+                &packages,
+                &installed,
+                &mapper,
+                cli.no_hooks,
+            )?;
+        }
         println!();
         list(&db)?;
         return Ok(());
@@ -414,6 +480,11 @@ fn parse_cli() -> Result<Cli, String> {
     let mut clean = false;
     let mut search = None;
     let mut install = None;
+    let mut sync = None;
+    let mut sync_all = false;
+    let mut prefer_arch = false;
+    let mut mirrors = None;
+    let mut repo_dir = None;
     let mut config = None;
     let mut no_hooks = false;
     let mut db = None;
@@ -458,6 +529,18 @@ fn parse_cli() -> Result<Cli, String> {
                 }
                 install = Some(arguments.remove(0));
             }
+            "sync" => {
+                if arguments.is_empty() {
+                    return Err("用法: xrpkg sync <url|mirror_name> | xrpkg sync --all".to_string());
+                }
+                let value = arguments.remove(0);
+                if value.starts_with("--") {
+                    // 让全局参数解析器处理 --all / --jobs 等；顺序可自由。
+                    arguments.insert(0, value);
+                } else {
+                    sync = Some(value);
+                }
+            }
             _ => arguments.insert(0, first),
         }
     }
@@ -477,8 +560,22 @@ fn parse_cli() -> Result<Cli, String> {
                     .ok_or_else(|| "`--config` 需要一个 repos.toml 路径".to_string())?;
                 config = Some(PathBuf::from(value));
             }
+            "--mirrors" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "`--mirrors` 需要一个 mirrors.toml 路径".to_string())?;
+                mirrors = Some(PathBuf::from(value));
+            }
+            "--repo-dir" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "`--repo-dir` 需要一个仓库目录".to_string())?;
+                repo_dir = Some(PathBuf::from(value));
+            }
             "--no-hooks" => no_hooks = true,
             "--allow-downgrade" => allow_downgrade = true,
+            "--prefer-arch" => prefer_arch = true,
+            "--all" => sync_all = true,
             "--no-sandbox" => no_sandbox = true,
             "--jobs" => {
                 let value = arguments
@@ -542,7 +639,7 @@ fn parse_cli() -> Result<Cli, String> {
             }
             _ => {
                 return Err(format!(
-                    "未知参数 `{argument}`；支持 init/install/update/clean/search/repo-add/repo-sign 子命令，或 `--root <dir>`、`--build <recipe>`、`--remove <pkg>`、`--deb <file>`、`--rpm <file>`、`--arch <file>`、`--config <file>`、`--cache <dir>`、`--key <gpg-key>`、`--allow-downgrade`、`--jobs <n>`、`--no-sandbox` 和 `--no-hooks`"
+                    "未知参数 `{argument}`；支持 init/install/update/clean/search/sync/repo-add/repo-sign 子命令，或 `--root <dir>`、`--build <recipe>`、`--remove <pkg>`、`--deb <file>`、`--rpm <file>`、`--arch <file>`、`--config <file>`、`--mirrors <file>`、`--repo-dir <dir>`、`--cache <dir>`、`--key <gpg-key>`、`--allow-downgrade`、`--prefer-arch`、`--jobs <n>`、`--no-sandbox` 和 `--no-hooks`"
                 ))
             }
         }
@@ -562,6 +659,11 @@ fn parse_cli() -> Result<Cli, String> {
         clean,
         search,
         install,
+        sync,
+        sync_all,
+        prefer_arch,
+        mirrors,
+        repo_dir,
         config,
         no_hooks,
         db,
@@ -849,8 +951,15 @@ fn install_arch(
 
     let abi_guard = AbiGuard::new(MAX_GLIBC_VERSION)?;
     for file in &files {
+        let staged = staging.path().join(file);
+        let staged_metadata = fs::symlink_metadata(&staged)
+            .map_err(|error| format!("检查暂存文件 `{}` 失败: {error}", staged.display()))?;
+        // 符号链接本身不是 ELF；其目标若是 ELF，已作为普通文件单独检查。
+        if staged_metadata.file_type().is_symlink() {
+            continue;
+        }
         let relative = file.to_string_lossy().replace('\\', "/");
-        abi_guard.check_file(&metadata.pkgname, &relative, &staging.path().join(file))?;
+        abi_guard.check_file(&metadata.pkgname, &relative, &staged)?;
     }
 
     let publish_paths = files

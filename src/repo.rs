@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::capability::{Capability, Version};
+use crate::download;
 use crate::installer;
+use crate::mirrors::Mirror;
 use crate::resolvo_solver::incremental_plan;
 use crate::sign;
 use crate::solver::{Package, SelectedPackage};
@@ -62,6 +64,9 @@ pub struct RepoPackage {
     pub requires: Vec<String>,
     pub filename: String,
     pub sha256: String,
+    /// 外部生态标记；`None` 表示原生 `.xpkg`，`Some("arch")` 表示 Arch 包。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// 仓库包在哪个仓库、用什么 URL 下载。
@@ -353,22 +358,6 @@ pub fn repo_add(repo_dir: &Path, package_path: &Path) -> Result<RepoIndex, Error
 
     fs::create_dir_all(repo_dir)
         .map_err(|error| format!("创建仓库目录 `{}` 失败: {error}", repo_dir.display()))?;
-    let index_path = repo_dir.join(INDEX_FILENAME);
-    let mut index = if index_path.is_file() {
-        load_index(&index_path, None)?
-    } else {
-        RepoIndex {
-            format: 1,
-            name: repo_dir
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("local")
-                .to_string(),
-            arch: std::env::consts::ARCH.to_string(),
-            packages: Vec::new(),
-        }
-    };
-
     let destination = repo_dir.join(&filename);
     let same_file = fs::canonicalize(package_path).ok() == fs::canonicalize(&destination).ok();
     if !same_file {
@@ -387,12 +376,53 @@ pub fn repo_add(repo_dir: &Path, package_path: &Path) -> Result<RepoIndex, Error
         requires: metadata.requires.iter().map(ToString::to_string).collect(),
         filename,
         sha256,
+        origin: None,
     };
 
-    index
-        .packages
-        .retain(|package| package.name != entry.name || package.version != entry.version);
-    index.packages.push(entry);
+    add_index_entries(repo_dir, &[entry])
+}
+
+/// 把一批已经落盘的包写入仓库索引；索引重建逻辑与 [`repo_add`] 共用。
+///
+/// 调用方负责先把文件放进 `repo_dir`；本函数只校验条目、去重并原子写回
+/// `xrpkg-repo.toml`，不复制包文件。
+pub fn add_index_entries(repo_dir: &Path, entries: &[RepoPackage]) -> Result<RepoIndex, Error> {
+    fs::create_dir_all(repo_dir)
+        .map_err(|error| format!("创建仓库目录 `{}` 失败: {error}", repo_dir.display()))?;
+    let index_path = repo_dir.join(INDEX_FILENAME);
+    let mut index = if index_path.is_file() {
+        load_index(&index_path, None)?
+    } else {
+        RepoIndex {
+            format: 1,
+            name: repo_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("local")
+                .to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            packages: Vec::new(),
+        }
+    };
+
+    for entry in entries {
+        validate_package_entry(entry)?;
+        let package_path = repo_dir.join(&entry.filename);
+        if !package_path.is_file() {
+            return Err(format!(
+                "仓库 `{}` 中缺少包文件 `{}`",
+                repo_dir.display(),
+                package_path.display()
+            ));
+        }
+        // 原生包和外部包可以同名同版本共存，因此来源也是身份的一部分。
+        index.packages.retain(|package| {
+            package.name != entry.name
+                || package.version != entry.version
+                || package.origin != entry.origin
+        });
+        index.packages.push(entry.clone());
+    }
     sort_packages(&mut index.packages);
     write_index(&index_path, &index)?;
     Ok(index)
@@ -405,15 +435,17 @@ pub fn build_pool(repos: &[CachedRepo]) -> Result<RepoPool, Error> {
     let mut claimed_names = BTreeSet::new();
 
     for repo in repos {
+        // 外部包暂时不参与原生 resolvo 求解，也不能抢走原生包的包名优先级。
         let names_in_repo = repo
             .index
             .packages
             .iter()
+            .filter(|package| package.origin.is_none())
             .map(|package| package.name.clone())
             .collect::<BTreeSet<_>>();
 
         for package in &repo.index.packages {
-            if claimed_names.contains(&package.name) {
+            if package.origin.is_some() || claimed_names.contains(&package.name) {
                 continue;
             }
             let version = Version::parse(&package.version).map_err(|error| {
@@ -483,8 +515,7 @@ pub fn download_packages(
             && sign::verify_detached(keyring, &signature, &target).is_ok();
         if !cached {
             let url = join_repo_url(&source.repo_url, &source.filename)?;
-            println!("==> 下载包 {}: {}", package.name, url);
-            fetch_package(&url, &target, &source.sha256, keyring)?;
+            fetch_package(&url, &target, &source.sha256, keyring, &package.name)?;
         } else {
             println!("==> 包缓存命中且签名有效: {}", target.display());
         }
@@ -518,6 +549,9 @@ pub fn clean_cache(
     let mut latest_versions = HashMap::<String, Version>::new();
     for repo in &repos {
         for package in &repo.index.packages {
+            if package.origin.is_some() {
+                continue;
+            }
             let version = Version::parse(&package.version).map_err(|error| {
                 format!(
                     "仓库 `{}` 的包 `{}` 版本 `{}` 非法: {error}",
@@ -599,8 +633,25 @@ pub fn clean_cache(
     Ok(report)
 }
 
+/// 安装请求最终落到哪条轨道。
+#[derive(Clone, Debug)]
+pub enum RepositoryInstall {
+    /// 原生 `.xpkg` 已在 `repo::install_from_repositories_with_mirrors` 内完成提交。
+    Native,
+    /// 需要调用方把下载好的 Arch 包交给兼容轨道安装器。
+    Arch(ArchDownload),
+}
+
+/// 已下载到本地缓存的 Arch 包。
+#[derive(Clone, Debug)]
+pub struct ArchDownload {
+    pub name: String,
+    pub version: String,
+    pub path: PathBuf,
+}
+
 #[allow(clippy::too_many_arguments)]
-/// 从缓存仓库安装指定包，先下载所有包，再进入事务性提交阶段。
+/// 从缓存仓库安装指定包；保留原有签名，仅处理原生 `.xpkg`。
 pub fn install_from_repositories(
     db: &mut LocalDb,
     config_path: &Path,
@@ -611,10 +662,67 @@ pub fn install_from_repositories(
     rootfs_path: &Path,
     no_hooks: bool,
 ) -> Result<(), Error> {
+    install_from_repositories_with_mirrors(
+        db,
+        config_path,
+        cache_dir,
+        requested,
+        requested_version,
+        allow_downgrade,
+        rootfs_path,
+        no_hooks,
+        None,
+        false,
+    )
+    .map(|_| ())
+}
+
+/// 从缓存仓库安装指定包，并在原生 `.xpkg` 与 Arch `.pkg.tar.zst` 之间分派。
+///
+/// 默认原生优先；只有 `--prefer-arch` 或者没有原生候选时才走 Arch 轨道。
+/// Arch 包只下载到缓存并返回，真正的安装由 CLI 调用现有兼容轨道逻辑完成。
+#[allow(clippy::too_many_arguments)]
+pub fn install_from_repositories_with_mirrors(
+    db: &mut LocalDb,
+    config_path: &Path,
+    cache_dir: &Path,
+    requested: &str,
+    requested_version: Option<&Version>,
+    allow_downgrade: bool,
+    rootfs_path: &Path,
+    no_hooks: bool,
+    mirrors_path: Option<&Path>,
+    prefer_arch: bool,
+) -> Result<RepositoryInstall, Error> {
     let repos = load_cached(config_path, cache_dir)?;
     let keyring = keyring_path(config_path)?;
     let pool = build_pool(&repos)?;
     let installed = db.list_installed()?;
+    let arch_package = select_arch_package(&repos, requested);
+    let native_available = pool
+        .packages
+        .iter()
+        .any(|package| package.name == requested);
+
+    if prefer_arch_package(prefer_arch, arch_package.is_some(), native_available) {
+        let package = arch_package.ok_or_else(|| format!("没有找到 Arch 兼容包 `{requested}`"))?;
+        if requested_version.is_some() {
+            return Err(format!(
+                "Arch 兼容包 `{requested}` 暂不支持 `包=版本` 语法，请直接使用包名"
+            ));
+        }
+        let mirrors_path = mirrors_path.ok_or_else(|| {
+            "安装 Arch 兼容包需要镜像配置；请提供 --mirrors 或创建 config/mirrors.toml".to_string()
+        })?;
+        let mirrors = crate::mirrors::load(mirrors_path)?;
+        let path = download_arch_package(package, cache_dir, &mirrors)?;
+        return Ok(RepositoryInstall::Arch(ArchDownload {
+            name: package.name.clone(),
+            version: package.version.clone(),
+            path,
+        }));
+    }
+
     let resolution = crate::resolvo_solver::resolve_install_version(
         &pool.packages,
         requested,
@@ -624,7 +732,7 @@ pub fn install_from_repositories(
     let changes = incremental_plan(&resolution, &installed);
     if changes.is_empty() {
         println!("{requested} 已经安装，无需操作");
-        return Ok(());
+        return Ok(RepositoryInstall::Native);
     }
     if !allow_downgrade {
         for change in &changes {
@@ -651,7 +759,84 @@ pub fn install_from_repositories(
         rootfs_path,
         no_hooks,
         allow_downgrade,
-    )
+    )?;
+    Ok(RepositoryInstall::Native)
+}
+
+/// 原生优先策略：只有显式 `--prefer-arch` 或没有原生候选时才选 Arch。
+fn prefer_arch_package(prefer_arch: bool, has_arch: bool, has_native: bool) -> bool {
+    has_arch && (prefer_arch || !has_native)
+}
+
+/// 在缓存索引中查找指定名称的 Arch 包。
+fn select_arch_package<'a>(repos: &'a [CachedRepo], requested: &str) -> Option<&'a RepoPackage> {
+    for repo in repos {
+        for package in &repo.index.packages {
+            if package.name == requested && package.origin.as_deref() == Some("arch") {
+                return Some(package);
+            }
+        }
+    }
+    None
+}
+
+/// 按镜像优先级下载 Arch 包到缓存；失败时自动尝试下一个镜像。
+fn download_arch_package(
+    package: &RepoPackage,
+    cache_dir: &Path,
+    mirrors: &[Mirror],
+) -> Result<PathBuf, Error> {
+    let target_dir = cache_dir.join("packages").join("arch");
+    fs::create_dir_all(&target_dir).map_err(|error| {
+        format!(
+            "创建 Arch 包缓存目录 `{}` 失败: {error}",
+            target_dir.display()
+        )
+    })?;
+    let target = target_dir.join(&package.filename);
+    if target.is_file() && verify_sha256(&target, &package.sha256).is_ok() {
+        println!("==> Arch 包缓存命中: {}", target.display());
+        return Ok(target);
+    }
+
+    let mut failures = Vec::new();
+    for mirror in mirrors {
+        let url = download::join_location(&mirror.url, &package.filename)?;
+        println!(
+            "==> 从镜像 {} 下载 Arch 包 {} {}: {}",
+            mirror.name, package.name, package.version, url
+        );
+        let bar = download::single_bar(0, &format!("下载 {}", package.name));
+        let partial = target.with_extension(format!("part-{}", unique_nonce()));
+        let downloaded = download::to_file(&url, &partial, &bar).inspect_err(|_| {
+            let _ = fs::remove_file(&partial);
+            bar.abandon_with_message(format!("失败 {}", package.name));
+        });
+        let downloaded = match downloaded {
+            Ok(written) => written,
+            Err(error) => {
+                failures.push(format!("{}: {error}", mirror.name));
+                continue;
+            }
+        };
+        if let Err(error) = verify_sha256(&partial, &package.sha256) {
+            let _ = fs::remove_file(&partial);
+            bar.abandon_with_message(format!("校验失败 {}", package.name));
+            failures.push(format!("{}: {error}", mirror.name));
+            continue;
+        }
+        if target.exists() {
+            let _ = fs::remove_file(&target);
+        }
+        fs::rename(&partial, &target).map_err(|error| {
+            let _ = fs::remove_file(&partial);
+            format!("保存 Arch 包 `{}` 失败: {error}", target.display())
+        })?;
+        bar.finish_with_message(format!("完成 {} ({} bytes)", package.name, downloaded));
+        return Ok(target);
+    }
+
+    Err(format!("所有镜像都下载失败: {}", failures.join("; ")))
 }
 
 /// 把一行仓库索引文本解析并校验。
@@ -689,42 +874,70 @@ fn validate_index(index: &RepoIndex, expected_name: Option<&str>) -> Result<(), 
 
     let mut identities = BTreeSet::new();
     for package in &index.packages {
-        if package.name.is_empty()
-            || package
-                .name
-                .chars()
-                .any(|character| character.is_whitespace() || matches!(character, '/' | '\\'))
-        {
-            return Err(format!("仓库索引中的包名 `{}` 非法", package.name));
-        }
-        let version = Version::parse(&package.version)
-            .map_err(|error| format!("仓库索引中的版本 `{}` 非法: {error}", package.version))?;
-        let _ = version;
-        for requirement in &package.requires {
-            Capability::parse(requirement)
-                .map_err(|error| format!("仓库索引中的依赖 `{requirement}` 非法: {error}"))?;
-        }
-        if package.filename.is_empty()
-            || package.filename.contains(['/', '\\'])
-            || package.filename == "."
-            || package.filename == ".."
-        {
-            return Err(format!("仓库索引中的文件名 `{}` 非法", package.filename));
-        }
-        if package.sha256.len() != 64
-            || !package
-                .sha256
-                .chars()
-                .all(|character| character.is_ascii_hexdigit())
-        {
-            return Err(format!("仓库索引中的包 `{}` 的 sha256 非法", package.name));
-        }
-        if !identities.insert((package.name.clone(), package.version.clone())) {
+        validate_package_entry(package)?;
+        if !identities.insert((
+            package.name.clone(),
+            package.version.clone(),
+            package.origin.clone(),
+        )) {
             return Err(format!(
                 "仓库索引中包 `{}` 版本 `{}` 重复",
                 package.name, package.version
             ));
         }
+    }
+    Ok(())
+}
+
+/// 校验单个索引条目；原生包要求 native Version，外部包保留原始版本字符串。
+fn validate_package_entry(package: &RepoPackage) -> Result<(), Error> {
+    if package.name.is_empty()
+        || package
+            .name
+            .chars()
+            .any(|character| character.is_whitespace() || matches!(character, '/' | '\\'))
+    {
+        return Err(format!("仓库索引中的包名 `{}` 非法", package.name));
+    }
+    match &package.origin {
+        Some(origin) => {
+            if origin.is_empty()
+                || origin
+                    .chars()
+                    .any(|character| character.is_whitespace() || matches!(character, '/' | '\\'))
+            {
+                return Err(format!("仓库索引中的来源标记 `{origin}` 非法"));
+            }
+            if package.version.is_empty() || package.version.chars().any(char::is_whitespace) {
+                return Err(format!(
+                    "仓库索引中外部包 `{}` 的版本 `{}` 非法",
+                    package.name, package.version
+                ));
+            }
+        }
+        None => {
+            Version::parse(&package.version)
+                .map_err(|error| format!("仓库索引中的版本 `{}` 非法: {error}", package.version))?;
+        }
+    }
+    for requirement in &package.requires {
+        Capability::parse(requirement)
+            .map_err(|error| format!("仓库索引中的依赖 `{requirement}` 非法: {error}"))?;
+    }
+    if package.filename.is_empty()
+        || package.filename.contains(['/', '\\'])
+        || package.filename == "."
+        || package.filename == ".."
+    {
+        return Err(format!("仓库索引中的文件名 `{}` 非法", package.filename));
+    }
+    if package.sha256.len() != 64
+        || !package
+            .sha256
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(format!("仓库索引中的包 `{}` 的 sha256 非法", package.name));
     }
     Ok(())
 }
@@ -743,9 +956,13 @@ fn validate_repo_name(name: &str) -> Result<(), Error> {
 fn sort_packages(packages: &mut [RepoPackage]) {
     packages.sort_by(|left, right| {
         left.name.cmp(&right.name).then_with(|| {
-            let left_version = Version::parse(&left.version).ok();
-            let right_version = Version::parse(&right.version).ok();
-            left_version.cmp(&right_version)
+            match (
+                Version::parse(&left.version),
+                Version::parse(&right.version),
+            ) {
+                (Ok(left_version), Ok(right_version)) => left_version.cmp(&right_version),
+                _ => left.version.cmp(&right.version),
+            }
         })
     });
 }
@@ -805,32 +1022,26 @@ fn fetch_bytes(url: &str) -> Result<Vec<u8>, Error> {
 }
 
 /// 下载单个包到缓存，校验 SHA256 和发布者 detached signature。
-fn fetch_package(url: &str, target: &Path, expected: &str, keyring: &Path) -> Result<(), Error> {
+fn fetch_package(
+    url: &str,
+    target: &Path,
+    expected: &str,
+    keyring: &Path,
+    label: &str,
+) -> Result<(), Error> {
     let partial = target.with_extension(format!("part-{}", unique_nonce()));
-    let result = if is_http(url) {
-        let response = ureq::get(url)
-            .set("User-Agent", "xrpkg/0.1")
-            .call()
-            .map_err(|error| format!("下载 `{url}` 失败: {error}"))?;
-        let mut reader = response.into_reader();
-        let mut file =
-            fs::File::create(&partial).map_err(|error| format!("创建下载临时文件失败: {error}"))?;
-        std::io::copy(&mut reader, &mut file)
-            .map_err(|error| format!("写入下载文件失败: {error}"))?;
-        file.sync_all()
-            .map_err(|error| format!("刷新下载文件失败: {error}"))?;
-        Ok(())
-    } else {
-        fs::copy(local_path(url)?, &partial)
-            .map(|_| ())
-            .map_err(|error| format!("复制包 `{url}` 失败: {error}"))
-    };
-    if let Err(error) = result {
+    if !download::progress_enabled() {
+        println!("==> 下载包 {label}: {url}");
+    }
+    let bar = download::single_bar(0, &format!("下载 {label}"));
+    if let Err(error) = download::to_file(url, &partial, &bar) {
         let _ = fs::remove_file(&partial);
+        bar.abandon_with_message(format!("失败 {label}"));
         return Err(error);
     }
     if let Err(error) = verify_sha256(&partial, expected) {
         let _ = fs::remove_file(&partial);
+        bar.abandon_with_message(format!("校验失败 {label}"));
         return Err(error);
     }
 
@@ -840,17 +1051,20 @@ fn fetch_package(url: &str, target: &Path, expected: &str, keyring: &Path) -> Re
         Ok(bytes) => bytes,
         Err(error) => {
             let _ = fs::remove_file(&partial);
+            bar.abandon_with_message(format!("缺少签名 {label}"));
             return Err(format!("包签名文件缺失或不可读: {error}"));
         }
     };
     if let Err(error) = fs::write(&pending_signature, signature) {
         let _ = fs::remove_file(&partial);
         let _ = fs::remove_file(&pending_signature);
+        bar.abandon_with_message(format!("签名写入失败 {label}"));
         return Err(format!("写入包签名临时文件失败: {error}"));
     }
     if let Err(error) = sign::verify_detached(keyring, &pending_signature, &partial) {
         let _ = fs::remove_file(&partial);
         let _ = fs::remove_file(&pending_signature);
+        bar.abandon_with_message(format!("签名无效 {label}"));
         return Err(error);
     }
     fs::rename(&partial, target).map_err(|error| {
@@ -861,10 +1075,12 @@ fn fetch_package(url: &str, target: &Path, expected: &str, keyring: &Path) -> Re
     fs::rename(&pending_signature, sign::signature_path(target)).map_err(|error| {
         let _ = fs::remove_file(&pending_signature);
         format!("保存包签名缓存失败: {error}")
-    })
+    })?;
+    bar.finish_with_message(format!("完成 {label}"));
+    Ok(())
 }
 
-fn sha256_file(path: &Path) -> Result<String, Error> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String, Error> {
     let mut file = fs::File::open(path)
         .map_err(|error| format!("打开文件 `{}` 失败: {error}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -913,4 +1129,44 @@ fn unique_nonce() -> u128 {
         .map(|duration| duration.as_nanos())
         .unwrap_or(0)
         ^ u128::from(std::process::id())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arch_repo() -> CachedRepo {
+        CachedRepo {
+            name: "repo".to_string(),
+            url: "file:///srv/repo".to_string(),
+            index: RepoIndex {
+                format: 1,
+                name: "repo".to_string(),
+                arch: "x86_64".to_string(),
+                packages: vec![RepoPackage {
+                    name: "acl".to_string(),
+                    version: "2.4.0-1".to_string(),
+                    requires: vec!["glibc".to_string()],
+                    filename: "acl-2.4.0-1-x86_64.pkg.tar.zst".to_string(),
+                    sha256: "0".repeat(64),
+                    origin: Some("arch".to_string()),
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn native_package_wins_unless_prefer_arch_is_set() {
+        assert!(!prefer_arch_package(false, true, true));
+        assert!(prefer_arch_package(true, true, true));
+        assert!(!prefer_arch_package(true, false, true));
+        assert!(prefer_arch_package(false, true, false));
+    }
+
+    #[test]
+    fn selects_arch_entries_by_name() {
+        let repos = [arch_repo()];
+
+        assert!(select_arch_package(&repos, "acl").is_some());
+        assert!(select_arch_package(&repos, "missing").is_none());
+    }
 }

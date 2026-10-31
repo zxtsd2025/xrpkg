@@ -1,0 +1,14 @@
+# xrpkg Arch 镜像源配置。
+# url 必须指向包含 core.db 的仓库目录；priority 越小优先级越高。
+# `xrpkg sync --all` 会按优先级同步全部镜像；`xrpkg sync tuna` 只同步指定镜像。
+# `xrpkg install <arch-pkg>` 会按优先级尝试这些 URL 下载 .pkg.tar.zst。
+
+[[mirrors]]
+name = "tuna"
+url = "https://mirrors.tuna.tsinghua.edu.cn/archlinux/core/os/x86_64/"
+priority = 1
+
+[[mirrors]]
+name = "ustc"
+url = "https://mirrors.ustc.edu.cn/archlinux/core/os/x86_64/"
+priority = 2

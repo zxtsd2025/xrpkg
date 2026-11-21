@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use xrpkg::abi::{AbiGuard, MAX_GLIBC_VERSION};
 use xrpkg::builder;
@@ -21,6 +20,7 @@ use xrpkg::repo;
 use xrpkg::resolvo_solver::{self, incremental_plan};
 use xrpkg::sign;
 use xrpkg::solver::{Package, SelectedPackage};
+use xrpkg::staging::StagingDir;
 use xrpkg::state::{InstalledPackage, LocalDb, PackageInstall};
 use xrpkg::sync;
 use xrpkg::transaction::{self, Transaction};
@@ -1543,37 +1543,6 @@ fn install(
         no_hooks,
         allow_downgrade,
     )
-}
-
-/// 临时暂存目录；离开作用域时自动清理。
-struct StagingDir {
-    path: PathBuf,
-}
-
-impl StagingDir {
-    /// 在系统临时目录下创建唯一暂存目录。
-    fn create() -> Result<Self, String> {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| format!("读取系统时间失败: {error}"))?
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("xrpkg-stage-{}-{nonce}", std::process::id()));
-        fs::create_dir(&path)
-            .map_err(|error| format!("创建暂存目录 `{}` 失败: {error}", path.display()))?;
-        Ok(Self { path })
-    }
-
-    /// 返回暂存目录路径。
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for StagingDir {
-    /// 删除暂存目录；ABI 校验失败时这就是安装回滚。
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
 }
 
 /// 根据计划中的包名和版本定位 repo/<name>-<version>.xpkg。

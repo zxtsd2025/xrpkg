@@ -206,3 +206,52 @@ fn reads_debian_maintainer_scripts() {
     assert_eq!(hooks[0].phase, "post_install");
     assert!(String::from_utf8_lossy(&hooks[0].script).contains("deb-postinst"));
 }
+
+#[test]
+fn extracts_relative_symlinks_with_rootfs_validation() {
+    let temp = TempDir::new().unwrap();
+    let mut builder = Builder::new(Vec::new());
+    let mut file = Header::new_gnu();
+    file.set_size(11);
+    file.set_mode(0o755);
+    builder
+        .append_data(&mut file, "./usr/lib/libhello.so.1", &b"hello-link\n"[..])
+        .unwrap();
+    let mut link = Header::new_gnu();
+    link.set_entry_type(EntryType::Symlink);
+    link.set_size(0);
+    link.set_mode(0o777);
+    builder
+        .append_link(&mut link, "./usr/lib/libhello.so", "libhello.so.1")
+        .unwrap();
+    let data = builder.into_inner().unwrap();
+    let deb = write_deb(&temp.path().join("link.deb"), &data);
+    let rootfs = temp.path().join("rootfs");
+
+    let files = extract_deb_data(&deb, &rootfs).unwrap();
+
+    assert!(files.contains(&PathBuf::from("usr/lib/libhello.so")));
+    assert_eq!(
+        fs::read_link(rootfs.join("usr/lib/libhello.so")).unwrap(),
+        PathBuf::from("libhello.so.1")
+    );
+}
+
+#[test]
+fn rejects_absolute_symlink_targets() {
+    let temp = TempDir::new().unwrap();
+    let mut builder = Builder::new(Vec::new());
+    let mut link = Header::new_gnu();
+    link.set_entry_type(EntryType::Symlink);
+    link.set_size(0);
+    link.set_mode(0o777);
+    builder
+        .append_link(&mut link, "./usr/lib/libhello.so", "/usr/lib/libhello.so.1")
+        .unwrap();
+    let data = builder.into_inner().unwrap();
+    let deb = write_deb(&temp.path().join("absolute.deb"), &data);
+
+    let error = extract_deb_data(&deb, &temp.path().join("rootfs")).unwrap_err();
+
+    assert!(error.contains("绝对路径"), "{error}");
+}

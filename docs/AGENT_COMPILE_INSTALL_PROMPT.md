@@ -9,7 +9,7 @@
 ## 环境与位置
 
 - 仓库：`/home/zxtsd/xrpkg`（当前开发机为原生 Arch Linux，cargo 命令直接在本机 shell 执行；WSL 只是早期历史环境，不要再使用 WSL/Windows 路径）
-- 工具链：`cargo` / `rustc` 1.100（若提示 “no default toolchain is configured”，在命令前加 `RUSTUP_TOOLCHAIN=stable`，或执行 `rustup default stable`）
+- 工具链：`cargo` / `rustc` 1.100；仓库自带 `rust-toolchain.toml`（stable），直接运行 `cargo` 即可（若仍提示 “no default toolchain is configured”，在命令前加 `RUSTUP_TOOLCHAIN=stable`，或执行 `rustup default stable`）
 - 构建依赖：C 工具链、`gpg`、`tar`、`gzip`、`zstd`、`unshare`
 - 网络：首次构建可能需要访问 crates.io；Arch 同步测试/实跑还需要访问镜像源
 - 目标架构：x86_64
@@ -49,7 +49,7 @@ CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo test
 
 - `cargo fmt --check` 通过；
 - `cargo clippy --all-targets -- -D warnings` 通过；
-- `cargo test`：35 个测试目标、201 个测试通过、0 失败。测试会为每个测试二进制使用独立临时缓存目录，不再写 `~/.cache/xrpkg`。
+- `cargo test`：35 个测试目标、206 个测试通过、0 失败。测试会为每个测试二进制使用独立临时缓存目录，不再写 `~/.cache/xrpkg`。
 
 如果测试失败，保留完整输出并报告，不要把它当成产品功能通过。
 
@@ -145,7 +145,7 @@ xrpkg sync 2>&1 | head -n 3
 1) cd /home/zxtsd/xrpkg
 2) cargo fmt --check
 3) cargo clippy --all-targets -- -D warnings
-4) CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo test（期望 35 个测试目标、201 个测试通过；测试使用独立临时缓存目录）
+4) CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo test（期望 35 个测试目标、206 个测试通过；测试使用独立临时缓存目录）
 5) cargo build --release --locked
 6) install -Dm755 target/release/xrpkg ~/.local/bin/xrpkg
 7) cargo test --test sync -- --nocapture

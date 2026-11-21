@@ -1,4 +1,4 @@
-//! xrpkg 的内部库：Capability、兼容轨道、签名仓库、LFS 隔离构建与并发日志、Rootfs 初始化、升级/降级事务、缓存清理、hooks 沙箱、元数据、文件权限/扩展属性、原子事务与崩溃恢复、resolvo、SQLite 状态、.xpkg、安装提交、卸载、.deb/.rpm/.pkg.tar.zst、依赖映射、ABI 守门、下载进度、镜像配置、Arch 仓库同步和玩具求解器。
+//! xrpkg 的内部库：Capability、兼容轨道（deb/rpm/arch）、签名仓库、LFS 隔离构建与并发日志、Rootfs 初始化、升级/降级事务、缓存清理、hooks 沙箱、安装后触发器、进程锁、元数据、文件权限/扩展属性、原子事务与崩溃恢复、resolvo、SQLite 状态、.xpkg、安装暂存、卸载、依赖映射、ABI 守门、RPM %caps、下载进度、镜像配置、Arch 仓库同步和玩具求解器。
 
 pub mod abi;
 pub mod builder;
@@ -19,6 +19,7 @@ pub mod resolvo_solver;
 pub mod rpm_caps;
 pub mod sign;
 pub mod solver;
+pub mod staging;
 pub mod state;
 pub mod sync;
 pub mod transaction;

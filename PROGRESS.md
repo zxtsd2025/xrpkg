@@ -47,7 +47,15 @@
 - **依赖闭包外置**：新增 `--no-deps`，用于依赖闭包已经在 xrpkg 之外解决（手工缝合 Arch 包）的场景；只跳过预检，ABI 守门和事务发布仍然执行。
 - **soname 映射**：`config/deps_map.toml` 增加 XFCE/Xorg 需要的 soname/虚拟依赖到 Arch 提供包的映射（glib2、libglvnd、systemd-libs、freetype2 等）。
 - **内核配方**：`recipes/linux.toml` 启用 DRM/VBOXVIDEO/VWMWFX 和 framebuffer console，内核模块安装到 `/usr/lib/modules`。
-- **测试**：新增 `publish_replaces_existing_file_with_hardlink`、`publish_replaces_symlinks_without_following_them`、`allows_dangling_symlink_target_for_later_package_files` 等用例；全量 174 个测试通过。
+- **测试**：新增 `publish_replaces_existing_file_with_hardlink`、`publish_replaces_symlinks_without_following_them`、`allows_dangling_symlink_target_for_later_package_files` 等用例；当时全量 174 个测试通过。
+
+## 整体优化（2026-11-21）
+- **兼容轨道符号链接**：`.deb`/`.rpm` 的相对符号链接改为通过统一的 `create_symlink` 安装，沿用 Rootfs 逃逸校验（悬空目标允许、绝对目标拒绝）；新增 4 个集成测试。
+- **暂存目录统一**：新增 `src/staging.rs`，`main.rs` 与 `installer.rs` 共用同一实现；目录名冲突时自动重试，`Drop` 统一清理。
+- **锁目录回退**：`XDG_RUNTIME_DIR` 不可写或不是绝对路径时自动回退 `/tmp/xrpkg-locks-<uid>`；`XRPKG_LOCK_DIR` 可显式覆盖，README 已记录。
+- **帮助文案**：`--no-hooks` 明确说明同时跳过安装后缓存触发器（中英双语）。
+- **工具链**：新增 `rust-toolchain.toml`（stable），本机不再需要手动设置 `RUSTUP_TOOLCHAIN`，普通 `cargo` 命令即可工作。
+- **测试基线**：35 个测试目标、206 个测试通过；fmt/clippy 全绿。
 
 ## 当前任务 (In Progress)
 **下一阶段待定**
@@ -58,4 +66,5 @@
 ## 已知差距 (Known Gaps)
 - 配方落后于基线：`recipes/glibc.toml` 仍是 2.39，`recipes/linux.toml` 是 6.7.4；`repo/glibc-2.44.xpkg` 存在，但无法用当前仓库内的配方重建。
 - `repo/xrpkg-repo.toml` 只索引了 `repo/` 的一部分产物（8 个包），与目录内容不同步；在重新生成索引前不要把它当作完整仓库清单。
+- `.deb`/`.rpm` 的绝对符号链接与 `.deb` 硬链接尚未支持；相对符号链接已覆盖。
 - 文档已对齐到阶段 31/32 的实际状态；此前 `AGENTS.md` 的“仅标准库/禁止 resolvo”和旧测试计数均已修正。

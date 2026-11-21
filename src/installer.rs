@@ -5,7 +5,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::abi::{AbiGuard, MAX_GLIBC_VERSION};
 use crate::capability::Version;
@@ -13,6 +12,7 @@ use crate::hooks::{
     self, HookScript, POST_INSTALL, POST_UPGRADE, PRE_INSTALL, PRE_REMOVE, PRE_UPGRADE,
 };
 use crate::solver::SelectedPackage;
+use crate::staging::StagingDir;
 use crate::state::{LocalDb, PackageInstall};
 use crate::transaction::{self, Transaction};
 use crate::triggers;
@@ -313,33 +313,5 @@ fn join_rollback(error: String, rollback: Result<(), String>) -> String {
     match rollback {
         Ok(()) => format!("{error}; 已回滚并恢复旧版本"),
         Err(rollback_error) => format!("{error}; 回滚/恢复失败: {rollback_error}"),
-    }
-}
-
-/// 临时暂存目录；离开作用域时自动清理。
-struct StagingDir {
-    path: PathBuf,
-}
-
-impl StagingDir {
-    fn create() -> Result<Self, String> {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| format!("读取系统时间失败: {error}"))?
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("xrpkg-stage-{}-{nonce}", std::process::id()));
-        fs::create_dir(&path)
-            .map_err(|error| format!("创建暂存目录 `{}` 失败: {error}", path.display()))?;
-        Ok(Self { path })
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for StagingDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
     }
 }

@@ -11,10 +11,10 @@ use rpm::{FileType, Package, PackageMetadata};
 
 use crate::capability::Capability;
 use crate::deps_map::DependencyMapper;
-use crate::fs_meta::EntryMetadata;
+use crate::fs_meta::{self, EntryMetadata};
 use crate::hooks::{HookScript, POST_INSTALL, POST_REMOVE, PRE_INSTALL, PRE_REMOVE};
 use crate::rpm_caps;
-use crate::xpkg::{ensure_directory, sanitize_relative, write_file, Rootfs};
+use crate::xpkg::{create_symlink, ensure_directory, sanitize_relative, write_file, Rootfs};
 
 /// 本模块使用的错误类型；当前统一用可读字符串。
 pub type Error = String;
@@ -172,10 +172,14 @@ pub fn extract_rpm_data(rpm_path: &Path, target_rootfs: &Path) -> Result<Vec<Pat
                 installed.insert(relative);
             }
             FileType::SymbolicLink => {
-                return Err(format!(
-                    "拒绝 RPM 中的符号链接 `{}`，防止链接逃逸 Rootfs",
-                    source_path.display()
-                ));
+                let target = file
+                    .metadata
+                    .linkto()
+                    .ok_or_else(|| format!("RPM 符号链接 `{}` 缺少目标", source_path.display()))?;
+                let metadata = EntryMetadata::from_mode(file.metadata.permissions() as u32);
+                create_symlink(rootfs.path(), &relative, Path::new(target))?;
+                fs_meta::apply_symlink_metadata(&rootfs.path().join(&relative), &metadata)?;
+                installed.insert(relative);
             }
             other => {
                 return Err(format!(

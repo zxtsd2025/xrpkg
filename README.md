@@ -76,7 +76,7 @@ The project targets **glibc 2.44** on x86_64. The recipes currently checked in a
 ### Requirements
 
 - Linux with user namespaces and `unshare`
-- Rust 2021 toolchain (tested with 1.100). If `cargo` reports “no default toolchain is configured”, run `rustup default stable` or prefix commands with `RUSTUP_TOOLCHAIN=stable`.
+- Rust 2021 toolchain (tested with 1.100). The repository's `rust-toolchain.toml` pins the stable channel, so plain `cargo` works; if you still see “no default toolchain is configured”, run `rustup default stable` or prefix commands with `RUSTUP_TOOLCHAIN=stable`.
 - C toolchain (`cc`, `make`) for bundled SQLite/zstd/xz
 - `gpg` for repository signatures
 - `tar`, `gzip`, and `zstd` for compatibility and sync workflows
@@ -109,7 +109,7 @@ For a copy-paste agent handoff, see [docs/AGENT_COMPILE_INSTALL_PROMPT.md](docs/
 
 ### Disk usage
 
-`cargo test` compiles debug dependencies and test binaries under `target/debug`; a full run can use several GB (debug info and incremental artifacts). For reference, a full debug test build in this workspace used about **6.9 GiB**, while `target/release` was about **444 MiB**. The installed `xrpkg` binary itself is only **9.7 MiB**.
+`cargo test` compiles debug dependencies and test binaries under `target/debug`; a full run can use many GB (debug info and incremental artifacts). In this workspace `target/debug` currently holds about **18 GiB** (including historical incremental artifacts) and `target/release` about **976 MiB**. The installed `xrpkg` binary itself is only **9.7 MiB**.
 
 After installing the release binary, reclaim space with:
 
@@ -272,7 +272,7 @@ xrpkg install ./package.rpm
 xrpkg install ./package.pkg.tar.zst
 ```
 
-Debian, RPM, and Arch metadata are parsed, dependencies are mapped through `config/deps_map.toml`, and the resulting files and hooks are recorded in the native SQLite database. External packages are not converted into `.xpkg`. The mapping file covers both Debian/RPM dependency names and Arch sonames such as `libz.so` and `libsystemd.so`. RPM `%caps` strings are converted to Linux VFS `security.capability` bytes; writing that xattr requires root or `CAP_SETFCAP`, and failure aborts the install instead of silently dropping the capability.
+Debian, RPM, and Arch metadata are parsed, dependencies are mapped through `config/deps_map.toml`, and the resulting files and hooks are recorded in the native SQLite database. External packages are not converted into `.xpkg`. The mapping file covers both Debian/RPM dependency names and Arch sonames such as `libz.so` and `libsystemd.so`. Relative symlinks from `.deb`/`.rpm` payloads are installed with the same rootfs-escape validation as native packages; absolute symlink targets are rejected. RPM `%caps` strings are converted to Linux VFS `security.capability` bytes; writing that xattr requires root or `CAP_SETFCAP`, and failure aborts the install instead of silently dropping the capability.
 
 Use `--no-deps` when the dependency closure is resolved outside xrpkg (for example a hand-assembled Arch closure): it skips only the preflight check, while the ABI guard and transactional publish still run.
 
@@ -345,7 +345,7 @@ xrpkg install hello --root /mnt/xros --db /mnt/xros/var/lib/xrpkg/local.db
 # different --root/--db pairs: run in parallel
 ```
 
-A conflicting process prints an error and exits non-zero without writing anything. Locks live under `$XDG_RUNTIME_DIR/xrpkg/locks` (or `/tmp/xrpkg-locks-<uid>` when no runtime directory exists), never enter package manifests, and are released by the kernel if the process crashes. Read-only commands (`list`, `search`, `help`, `version`) do not take the lock.
+A conflicting process prints an error and exits non-zero without writing anything. Locks live under `$XDG_RUNTIME_DIR/xrpkg/locks` (or `/tmp/xrpkg-locks-<uid>` when no runtime directory is usable); set `XRPKG_LOCK_DIR` to override this location, which is useful for tests and containers. Lock files never enter package manifests and are released by the kernel if the process crashes. Read-only commands (`list`, `search`, `help`, `version`) do not take the lock.
 
 ### Post-install cache triggers
 
@@ -410,6 +410,7 @@ src/
   sync.rs        Arch core.db sync and parallel ingest
   sign.rs        OpenPGP detached signatures
   state.rs       SQLite state
+  staging.rs     shared install staging directories
   metadata.rs    scenario/repository TOML loading
   deps_map.rs    external dependency and soname mapping
   rpm_caps.rs    RPM %caps text to security.capability bytes
@@ -447,7 +448,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Current local result: **201 tests passed across 35 test targets**. Some tests require `unshare`, user namespaces, `gpg`, `setcap` (root-only capability test), and `zstd`.
+Current local result: **206 tests passed across 35 test targets**. Some tests require `unshare`, user namespaces, `gpg`, `setcap` (root-only capability test), and `zstd`.
 
 Each test binary uses its own temporary `XDG_CACHE_HOME`, so parallel test binaries no longer share `~/.cache/xrpkg` and cannot collide with `Text file busy` (ETXTBSY).
 
@@ -470,6 +471,7 @@ The build sandbox isolates mounts and the filesystem view, but it is not a virtu
 - The ABI baseline is `GLIBC_2.44`, but the committed glibc recipe builds 2.39; `repo/glibc-2.44.xpkg` cannot currently be rebuilt from this tree.
 - LFS glibc/gcc recipes are present and configure-verified; full toolchain builds are long and hardware-dependent.
 - Compat tracks record external packages in the native database, but do not rewrite their dependency metadata.
+- `.deb`/`.rpm` payloads support relative symlinks only; absolute targets and `.deb` hardlinks are not installed.
 - `sync` does not sign the repository automatically; the existing `repo-sign` step is still required before `xrpkg update`.
 - Only the Arch/Pacman ecosystem is synced in this phase; apt/dnf are not implemented.
 - Repository signatures depend on a system `gpg` installation.
@@ -520,7 +522,7 @@ The build sandbox isolates mounts and the filesystem view, but it is not a virtu
 ### 环境要求
 
 - Linux，支持 user namespace 和 `unshare`
-- Rust 2021 工具链（已在 1.100 上验证）。如果 `cargo` 报“no default toolchain is configured”，执行 `rustup default stable`，或在命令前加 `RUSTUP_TOOLCHAIN=stable`。
+- Rust 2021 工具链（已在 1.100 上验证）。仓库自带 `rust-toolchain.toml` 固定 stable 通道，直接运行 `cargo` 即可；如果仍报“no default toolchain is configured”，执行 `rustup default stable`，或在命令前加 `RUSTUP_TOOLCHAIN=stable`。
 - C 工具链（`cc`、`make`），用于 bundled SQLite/zstd/xz
 - 仓库签名需要 `gpg`
 - 兼容/同步流程需要 `tar`、`gzip`、`zstd`
@@ -553,7 +555,7 @@ xrpkg sync --all --jobs 4
 
 ### 磁盘占用
 
-`cargo test` 会在 `target/debug` 下编译 debug 依赖和测试二进制，完整跑一遍可能达到数 GB（调试信息和增量产物）。本工作区实测：`target/debug` 约 **6.9 GiB**，`target/release` 约 **444 MiB**；真正安装的 `xrpkg` 二进制只有 **9.7 MiB**。
+`cargo test` 会在 `target/debug` 下编译 debug 依赖和测试二进制，完整跑一遍可能达到十几 GB（调试信息和增量产物）。本工作区当前 `target/debug` 约 **18 GiB**（含历史增量产物），`target/release` 约 **976 MiB**；真正安装的 `xrpkg` 二进制只有 **9.7 MiB**。
 
 安装 release 二进制后，可以这样释放空间：
 
@@ -718,7 +720,7 @@ xrpkg install ./package.rpm
 xrpkg install ./package.pkg.tar.zst
 ```
 
-解析 Debian、RPM、Arch 元数据，通过 `config/deps_map.toml` 映射依赖，并把文件与 hooks 记录到 native SQLite 数据库。外部包不会被转换成 `.xpkg`。映射表同时覆盖 Debian/RPM 依赖名和 Arch soname（如 `libz.so`、`libsystemd.so`）。RPM 的 `%caps` 文本会转换为 Linux VFS `security.capability` 字节；写入该属性需要 root 或 `CAP_SETFCAP`，失败时安装中止，而不是静默丢掉 capability。
+解析 Debian、RPM、Arch 元数据，通过 `config/deps_map.toml` 映射依赖，并把文件与 hooks 记录到 native SQLite 数据库。外部包不会被转换成 `.xpkg`。映射表同时覆盖 Debian/RPM 依赖名和 Arch soname（如 `libz.so`、`libsystemd.so`）。`.deb`/`.rpm` 中的相对符号链接会按与原生包相同的 Rootfs 逃逸规则校验后安装；绝对目标会被拒绝。RPM 的 `%caps` 文本会转换为 Linux VFS `security.capability` 字节；写入该属性需要 root 或 `CAP_SETFCAP`，失败时安装中止，而不是静默丢掉 capability。
 
 依赖闭包已在 xrpkg 之外解决时（例如手工缝合的 Arch 闭包），可用 `--no-deps` 只跳过预检；ABI 守门和事务发布仍会执行。
 
@@ -791,7 +793,7 @@ xrpkg install hello --root /mnt/xros --db /mnt/xros/var/lib/xrpkg/local.db
 # 不同的 --root/--db：可以并行
 ```
 
-冲突进程会打印错误并以非 0 退出，且不写入任何文件。锁文件位于 `$XDG_RUNTIME_DIR/xrpkg/locks`（没有运行时目录时用 `/tmp/xrpkg-locks-<uid>`），不会进入包清单；进程崩溃时由内核释放。只读命令（`list`、`search`、`help`、`version`）不加锁。
+冲突进程会打印错误并以非 0 退出，且不写入任何文件。锁文件位于 `$XDG_RUNTIME_DIR/xrpkg/locks`（没有可用运行时目录时用 `/tmp/xrpkg-locks-<uid>`）；可以用 `XRPKG_LOCK_DIR` 覆盖，便于测试和容器。锁不会进入包清单；进程崩溃时由内核释放。只读命令（`list`、`search`、`help`、`version`）不加锁。
 
 ### 安装后缓存触发器
 
@@ -856,6 +858,7 @@ src/
   sync.rs        Arch core.db 同步与并发入库
   sign.rs        OpenPGP 分离签名
   state.rs       SQLite 状态
+  staging.rs     原生/兼容轨道共用的安装暂存目录
   metadata.rs    场景/仓库 TOML 加载
   deps_map.rs    外部依赖与 soname 映射
   rpm_caps.rs    RPM %caps 文本到 security.capability 字节
@@ -893,7 +896,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-当前本地结果：**35 个测试目标、201 个测试通过**。部分测试需要 `unshare`、user namespace、`gpg`、`setcap`（root-only capability 用例）和 `zstd`。
+当前本地结果：**35 个测试目标、206 个测试通过**。部分测试需要 `unshare`、user namespace、`gpg`、`setcap`（root-only capability 用例）和 `zstd`。
 
 每个测试二进制使用独立的临时 `XDG_CACHE_HOME`，并行运行的测试目标不再共用 `~/.cache/xrpkg`，不会再出现 `Text file busy`（ETXTBSY）冲突。
 
@@ -916,6 +919,7 @@ cargo fmt --check
 - ABI 基线是 `GLIBC_2.44`，但仓库内已提交的 glibc 配方构建的是 2.39；`repo/glibc-2.44.xpkg` 当前无法从本仓库重建。
 - LFS glibc/gcc 配方已包含并验证 configure；完整工具链构建耗时长且依赖硬件。
 - 兼容轨道会把外部包记录到 native 数据库，但不会重写其依赖元数据。
+- `.deb`/`.rpm` 只支持相对符号链接；绝对目标和 `.deb` 硬链接尚未安装。
 - `sync` 不会自动签名仓库；执行 `xrpkg update` 前仍需走既有 `repo-sign` 流程。
 - 本阶段只同步 Arch/Pacman 生态，尚未实现 apt/dnf。
 - 仓库签名依赖系统 `gpg`。

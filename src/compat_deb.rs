@@ -19,9 +19,11 @@ use liblzma::read::XzDecoder;
 
 use crate::capability::Capability;
 use crate::deps_map::DependencyMapper;
-use crate::fs_meta::EntryMetadata;
+use crate::fs_meta::{self, EntryMetadata};
 use crate::hooks::{HookScript, POST_INSTALL, POST_REMOVE, PRE_INSTALL, PRE_REMOVE};
-use crate::xpkg::{ensure_directory_with_metadata, sanitize_relative, write_file, Rootfs};
+use crate::xpkg::{
+    create_symlink, ensure_directory_with_metadata, sanitize_relative, write_file, Rootfs,
+};
 
 /// 本模块使用的错误类型；当前统一用可读字符串。
 pub type Error = String;
@@ -155,10 +157,14 @@ pub fn extract_deb_data(deb_path: &Path, target_rootfs: &Path) -> Result<Vec<Pat
             write_file(rootfs.path(), &relative, &mut entry, size, &metadata)?;
             installed.insert(relative);
         } else if entry_type.is_symlink() {
-            return Err(format!(
-                "拒绝 data.tar 中的符号链接 `{}`，防止通过链接逃逸 Rootfs",
-                path.display()
-            ));
+            let metadata = EntryMetadata::from_tar(&mut entry)?;
+            let link_target = entry
+                .link_name()
+                .map_err(|error| format!("读取符号链接目标 `{}` 失败: {error}", path.display()))?
+                .ok_or_else(|| format!("符号链接 `{}` 缺少目标", path.display()))?;
+            create_symlink(rootfs.path(), &relative, link_target.as_ref())?;
+            fs_meta::apply_symlink_metadata(&rootfs.path().join(&relative), &metadata)?;
+            installed.insert(relative);
         } else {
             return Err(format!(
                 "拒绝 data.tar 中的非普通文件/目录条目 `{}`",

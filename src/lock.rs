@@ -33,10 +33,7 @@ impl ProcessLock {
     ///
     /// 同一组合已被其他进程持有时立即失败，不等待；不同组合互不影响。
     pub fn acquire(rootfs: &Path, database: &Path) -> Result<Self, String> {
-        let directory = lock_directory();
-        fs::create_dir_all(&directory)
-            .map_err(|error| format!("创建锁目录 `{}` 失败: {error}", directory.display()))?;
-        ensure_private_directory(&directory)?;
+        let directory = prepare_lock_directory()?;
 
         let path = directory.join(format!("{}.lock", identity(rootfs, database)));
         let file = OpenOptions::new()
@@ -85,21 +82,45 @@ impl Drop for ProcessLock {
     }
 }
 
-/// 锁目录优先级：显式环境变量 > XDG 运行时目录 > 按 uid 隔离的临时目录。
-fn lock_directory() -> PathBuf {
+/// 锁目录候选：显式环境变量 > XDG 运行时目录 > 按 uid 隔离的临时目录。
+fn lock_directory_candidates() -> Vec<PathBuf> {
     if let Some(directory) = std::env::var_os("XRPKG_LOCK_DIR") {
         if !directory.is_empty() {
-            return PathBuf::from(directory);
+            // 显式指定时不再回退，避免把锁放到用户不知道的位置。
+            return vec![PathBuf::from(directory)];
         }
     }
+    let mut candidates = Vec::new();
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        if !runtime.is_empty() {
-            return PathBuf::from(runtime).join("xrpkg/locks");
+        let runtime = PathBuf::from(runtime);
+        if runtime.is_absolute() {
+            candidates.push(runtime.join("xrpkg/locks"));
         }
     }
     // SAFETY: geteuid 只读取进程凭据，不修改任何状态。
     let uid = unsafe { libc::geteuid() };
-    std::env::temp_dir().join(format!("xrpkg-locks-{uid}"))
+    candidates.push(std::env::temp_dir().join(format!("xrpkg-locks-{uid}")));
+    candidates
+}
+
+/// 依次尝试候选目录；运行时目录存在但不可写时回退到临时目录。
+fn prepare_lock_directory() -> Result<PathBuf, String> {
+    let mut failures = Vec::new();
+    for directory in lock_directory_candidates() {
+        let result = fs::create_dir_all(&directory)
+            .map_err(|error| format!("创建锁目录 `{}` 失败: {error}", directory.display()))
+            .and_then(|()| ensure_private_directory(&directory))
+            .and_then(|()| {
+                fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(
+                    |error| format!("设置锁目录 `{}` 权限失败: {error}", directory.display()),
+                )
+            });
+        match result {
+            Ok(()) => return Ok(directory),
+            Err(error) => failures.push(format!("{}: {error}", directory.display())),
+        }
+    }
+    Err(format!("无法准备锁目录：{}", failures.join("；")))
 }
 
 /// 确认锁目录属于当前用户，避免在共享 /tmp 下误用他人预建的目录。
@@ -137,9 +158,21 @@ fn identity(rootfs: &Path, database: &Path) -> String {
 }
 
 /// 优先使用解析过符号链接的规范路径；路径不存在时退回到绝对路径。
+/// 优先使用解析过符号链接的规范路径；目标不存在时规范化父目录后拼回文件名。
+///
+/// 这样 `/tmp/./root`、`/tmp/a/../root` 等写法会归一到同一把锁，而不是因为
+/// 目标尚未创建就产生不同哈希。
 fn normalize(path: &Path) -> PathBuf {
-    fs::canonicalize(path)
-        .unwrap_or_else(|_| std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()))
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
+    }
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    if let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name()) {
+        if let Ok(canonical_parent) = fs::canonicalize(parent) {
+            return canonical_parent.join(name);
+        }
+    }
+    absolute
 }
 
 #[cfg(test)]
@@ -158,6 +191,21 @@ mod tests {
         assert_ne!(
             identity(root_a, db),
             identity(root_a, Path::new("/tmp/other.db"))
+        );
+    }
+
+    #[test]
+    fn dot_segments_normalize_to_the_same_lock_identity() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join("sub")).unwrap();
+        let direct = temp.path().join("root");
+        let with_dots = temp.path().join("sub/../root");
+        let database = temp.path().join("sub/../local.db");
+
+        assert_eq!(normalize(&direct), normalize(&with_dots));
+        assert_eq!(
+            identity(&direct, &database),
+            identity(&with_dots, &database)
         );
     }
 

@@ -185,3 +185,44 @@ fn reads_rpm_scriptlets() {
         .script
         .starts_with(b"echo rpm-postinst"));
 }
+
+#[test]
+fn extracts_relative_symlinks_with_rootfs_validation() {
+    let temp = TempDir::new().unwrap();
+    let rpm = temp.path().join("link.rpm");
+    let mut builder = PackageBuilder::new("link-rpm", "1.0", "MIT", "x86_64", "symlink");
+    builder
+        .with_symlink(FileOptions::symlink(
+            "/usr/lib/libhello.so",
+            "libhello.so.1",
+        ))
+        .unwrap();
+    builder.build().unwrap().write_file(&rpm).unwrap();
+    let rootfs = temp.path().join("rootfs");
+
+    let files = extract_rpm_data(&rpm, &rootfs).unwrap();
+
+    assert!(files.contains(&PathBuf::from("usr/lib/libhello.so")));
+    assert_eq!(
+        fs::read_link(rootfs.join("usr/lib/libhello.so")).unwrap(),
+        PathBuf::from("libhello.so.1")
+    );
+}
+
+#[test]
+fn rejects_absolute_symlink_targets() {
+    let temp = TempDir::new().unwrap();
+    let rpm = temp.path().join("absolute.rpm");
+    let mut builder = PackageBuilder::new("absolute-rpm", "1.0", "MIT", "x86_64", "symlink");
+    builder
+        .with_symlink(FileOptions::symlink(
+            "/usr/lib/libhello.so",
+            "/usr/lib/libhello.so.1",
+        ))
+        .unwrap();
+    builder.build().unwrap().write_file(&rpm).unwrap();
+
+    let error = extract_rpm_data(&rpm, &temp.path().join("rootfs")).unwrap_err();
+
+    assert!(error.contains("绝对路径"), "{error}");
+}

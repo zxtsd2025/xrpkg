@@ -328,7 +328,7 @@ impl Ui {
         println!("  --mirrors <file>         Arch mirror configuration");
         println!("  --repo-dir <dir>         Local .xpkg repository directory");
         println!("  --jobs <n>               Parallel build/download jobs");
-        println!("  --no-hooks               Skip lifecycle hooks");
+        println!("  --no-hooks               Skip lifecycle hooks and cache triggers");
         println!("  --no-sandbox             Disable build sandbox");
         println!("  --no-deps                Skip dependency preflight");
         println!("  --allow-downgrade        Allow version downgrade");
@@ -374,7 +374,7 @@ impl Ui {
         println!("  --mirrors <文件>         Arch 镜像配置");
         println!("  --repo-dir <目录>        本地 .xpkg 仓库目录");
         println!("  --jobs <n>               并行构建/下载数");
-        println!("  --no-hooks               跳过生命周期 hooks");
+        println!("  --no-hooks               跳过生命周期 hooks 和缓存触发器");
         println!("  --no-sandbox             关闭构建沙箱");
         println!("  --no-deps                跳过依赖预检");
         println!("  --allow-downgrade        允许版本降级");

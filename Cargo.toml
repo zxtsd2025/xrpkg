@@ -2,7 +2,7 @@
 name = "xrpkg"
 version = "0.1.0"
 edition = "2021"
-description = "xrpkg 包管理器的阶段 22 内核与基础用户态配方"
+description = "xrpkg：自建 LFS 发行版包管理器（原生 .xpkg + deb/rpm/arch 兼容轨道）"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

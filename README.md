@@ -10,9 +10,9 @@
 - **Native track**: build LFS-style source recipes into `.xpkg` packages, then sign them for a repository.
 - **Compatibility track**: install upstream `.deb`, `.rpm`, and `.pkg.tar.zst` packages while recording their files and hooks in one local SQLite database.
 
-The project currently targets the **LFS 12.1 baseline**: glibc 2.44, x86_64, and a modern LFS userspace.
+The project targets **glibc 2.44** on x86_64. The recipes currently checked in are the LFS 12.1 set (glibc 2.39 / Linux 6.7.4); see [Recipes](#recipes) and `PROGRESS.md` → “已知差距”.
 
-> **Status:** experimental, phase 30. Native/compat install, Arch sync, concurrent downloads, repository signing, and build flows are tested, but this is not yet a production package manager.
+> **Status:** experimental, phase 32. Native/compat install, Arch sync, concurrent downloads, repository signing, build flows, and the phase-32 compatibility publishing changes are covered by tests, but this is not yet a production package manager; a full XFCE/Xorg install on XROS is not yet documented.
 
 ### Highlights
 
@@ -49,6 +49,9 @@ The project currently targets the **LFS 12.1 baseline**: glibc 2.44, x86_64, and
 - **Arch repository sync and compatibility install**  
   Parse a Pacman `core.db`, download `.pkg.tar.zst` files concurrently, run the ABI guard, and install `origin = "arch"` packages through the compatibility track. External upgrades and uninstalls use the same transactional snapshots as native packages.
 
+- **Publishing over occupied paths**  
+  Files and links can be published over existing symlinks or hardlinks without writing through them. A symlink target may be created later by the same package as long as its nearest existing ancestor stays inside the root. `--no-deps` skips dependency preflight for closures resolved outside xrpkg.
+
 - **Local `.xpkg` install**  
   `xrpkg install ./foo.xpkg` validates metadata, preflights dependencies, runs the ABI guard, and commits through the same transaction path as repository installs.
 
@@ -64,7 +67,7 @@ The project currently targets the **LFS 12.1 baseline**: glibc 2.44, x86_64, and
 ### Requirements
 
 - Linux with user namespaces and `unshare`
-- Rust 2021 toolchain (tested with 1.99)
+- Rust 2021 toolchain (tested with 1.100). If `cargo` reports “no default toolchain is configured”, run `rustup default stable` or prefix commands with `RUSTUP_TOOLCHAIN=stable`.
 - C toolchain (`cc`, `make`) for bundled SQLite/zstd/xz
 - `gpg` for repository signatures
 - `tar`, `gzip`, and `zstd` for compatibility and sync workflows
@@ -260,7 +263,9 @@ xrpkg install ./package.rpm
 xrpkg install ./package.pkg.tar.zst
 ```
 
-Debian, RPM, and Arch metadata are parsed, dependencies are mapped through `config/deps_map.toml`, and the resulting files and hooks are recorded in the native SQLite database. External packages are not converted into `.xpkg`.
+Debian, RPM, and Arch metadata are parsed, dependencies are mapped through `config/deps_map.toml`, and the resulting files and hooks are recorded in the native SQLite database. External packages are not converted into `.xpkg`. The mapping file covers both Debian/RPM dependency names and Arch sonames such as `libz.so` and `libsystemd.so`.
+
+Use `--no-deps` when the dependency closure is resolved outside xrpkg (for example a hand-assembled Arch closure): it skips only the preflight check, while the ABI guard and transactional publish still run.
 
 ### Arch repository sync and installation
 
@@ -357,10 +362,14 @@ sudo chroot /tmp/xrpkg-root /bin/bash
 ```text
 src/
   main.rs        CLI and command dispatch
+  abi.rs         ELF GNU version check against the GLIBC baseline
+  capability.rs  version parsing and package capability constraints
   builder.rs     source recipes, sandbox, logging
   installer.rs   staging, ABI checks, upgrade transactions
   fs_meta.rs     permissions, ownership, xattrs, and PAX decoding
   transaction.rs atomic publish, snapshots, journal, crash recovery
+  uninstall.rs   database-driven removal and empty-directory cleanup
+  world.rs       recipes/system.toml orchestration (build-world)
   hooks.rs       lifecycle hooks and hook sandbox
   repo.rs        repository indexes, cache, downloads, cleanup
   download.rs    streaming HTTP/local downloads and progress bars
@@ -369,7 +378,9 @@ src/
   sync.rs        Arch core.db sync and parallel ingest
   sign.rs        OpenPGP detached signatures
   state.rs       SQLite state
-  solver.rs      selected-package type
+  metadata.rs    scenario/repository TOML loading
+  deps_map.rs    external dependency and soname mapping
+  solver.rs      toy solver kept as the resolvo baseline
   resolvo_solver.rs dependency solving
   xpkg.rs        .xpkg writer/reader and safe extraction
   compat_*.rs    deb/rpm/arch compatibility tracks
@@ -393,6 +404,8 @@ var/             local SQLite state (ignored)
 | `bash` | 5.2.21 |
 | `coreutils` | 9.4 |
 
+> The ABI guard baseline is `GLIBC_2.44`, but the committed glibc recipe builds 2.39. `repo/glibc-2.44.xpkg` was produced outside this recipe set and cannot currently be rebuilt from this tree; see `PROGRESS.md` → “已知差距”.
+
 ### Tests
 
 ```sh
@@ -402,6 +415,8 @@ cargo fmt --check
 ```
 
 Current local result: **174 tests passed across 32 test targets**. Some tests require `unshare`, user namespaces, `gpg`, `setcap` (root-only capability test), and `zstd`.
+
+Test binaries share `~/.cache/xrpkg`, so a parallel run can occasionally fail with `Text file busy` (ETXTBSY). Remove `~/.cache/xrpkg/downloads/fetched-*` and rerun; making each test use a private cache directory is a known follow-up.
 
 ### Security model and scope
 
@@ -419,11 +434,14 @@ The build sandbox isolates mounts and the filesystem view, but it is not a virtu
 ### Limitations
 
 - Not production-ready.
+- The ABI baseline is `GLIBC_2.44`, but the committed glibc recipe builds 2.39; `repo/glibc-2.44.xpkg` cannot currently be rebuilt from this tree.
 - LFS glibc/gcc recipes are present and configure-verified; full toolchain builds are long and hardware-dependent.
 - Compat tracks record external packages in the native database, but do not rewrite their dependency metadata.
 - `sync` does not sign the repository automatically; the existing `repo-sign` step is still required before `xrpkg update`.
 - Only the Arch/Pacman ecosystem is synced in this phase; apt/dnf are not implemented.
 - Repository signatures depend on a system `gpg` installation.
+- The checked-in `repo/xrpkg-repo.toml` indexes only part of `repo/`; regenerate it with `repo-add` before treating it as a complete index.
+- Tests share `~/.cache/xrpkg` and can collide under parallel execution (see Tests).
 
 [中文](#zh)
 
@@ -439,9 +457,9 @@ The build sandbox isolates mounts and the filesystem view, but it is not a virtu
 - **原生轨道**：把 LFS 风格的源码配方构建为 `.xpkg` 包，再为仓库签名。
 - **兼容轨道**：安装上游 `.deb`、`.rpm`、`.pkg.tar.zst`，并把文件与 hooks 统一记录到本地 SQLite 数据库。
 
-当前目标基线为 **LFS 12.1**：glibc 2.44、x86_64、现代 LFS 用户态。
+当前目标基线为 **glibc 2.44**、x86_64。仓库内已提交的配方仍是 LFS 12.1 那一套（glibc 2.39 / Linux 6.7.4）；见“配方”和 `PROGRESS.md` 的“已知差距”。
 
-> **状态：** 实验性，阶段 30。原生/兼容安装、Arch 同步、并发下载、仓库签名和构建流程已有测试，但还不是生产级包管理器。
+> **状态：** 实验性，阶段 32。原生/兼容安装、Arch 同步、并发下载、仓库签名、构建流程和阶段 32 的兼容发布改动都有测试覆盖，但还不是生产级包管理器；XROS 上的完整 XFCE/Xorg 安装尚未形成文档。
 
 ### 主要特性
 
@@ -456,6 +474,7 @@ The build sandbox isolates mounts and the filesystem view, but it is not a virtu
 - **OpenPGP 仓库签名**：索引和包使用分离 `.sig`，按显式信任 keyring 验证。
 - **隔离构建沙箱**：user/mount namespace、只读 `/usr`、独立 `/tmp`、绑定源码和输出目录。
 - **Arch 仓库同步与兼容安装**：解析 Pacman `core.db`，并发下载 `.pkg.tar.zst`，通过 ABI 守门后按 `origin = "arch"` 走兼容轨道安装。外部包的升级与卸载同样使用事务快照。
+- **覆盖已有路径的发布**：文件和链接可以覆盖已有的符号链接/硬链接，但绝不通过链接写穿到目标；符号链接可以先指向同批后续文件才会创建的路径，只要最近的已存在祖先仍在 Rootfs 内。`--no-deps` 用于依赖闭包已在 xrpkg 之外解决的场景。
 - **本地 `.xpkg` 安装**：`xrpkg install ./foo.xpkg` 会校验元数据、预检依赖、运行 ABI 守门，并走与仓库安装相同的提交事务。
 - **标准化、多语言 CLI**：根据 `LC_ALL`/`LC_MESSAGES`/`LANG` 选择中文或英文；非 UTF-8 终端自动回退到 ASCII 英文，避免方块。操作使用 `::`、`->`、`[ok]`、`warning:`、`error:` 和自动对齐表格；颜色只在 TTY 下启用。`--help`、`--version`、`list` 是一等命令。
 - **并发下载与彩色进度条**：每个包显示速度、字节数、百分比和 ETA；stderr 不是终端时自动隐藏。
@@ -464,7 +483,7 @@ The build sandbox isolates mounts and the filesystem view, but it is not a virtu
 ### 环境要求
 
 - Linux，支持 user namespace 和 `unshare`
-- Rust 2021 工具链（已在 1.99 上验证）
+- Rust 2021 工具链（已在 1.100 上验证）。如果 `cargo` 报“no default toolchain is configured”，执行 `rustup default stable`，或在命令前加 `RUSTUP_TOOLCHAIN=stable`。
 - C 工具链（`cc`、`make`），用于 bundled SQLite/zstd/xz
 - 仓库签名需要 `gpg`
 - 兼容/同步流程需要 `tar`、`gzip`、`zstd`
@@ -662,7 +681,9 @@ xrpkg install ./package.rpm
 xrpkg install ./package.pkg.tar.zst
 ```
 
-解析 Debian、RPM、Arch 元数据，通过 `config/deps_map.toml` 映射依赖，并把文件与 hooks 记录到 native SQLite 数据库。外部包不会被转换成 `.xpkg`。
+解析 Debian、RPM、Arch 元数据，通过 `config/deps_map.toml` 映射依赖，并把文件与 hooks 记录到 native SQLite 数据库。外部包不会被转换成 `.xpkg`。映射表同时覆盖 Debian/RPM 依赖名和 Arch soname（如 `libz.so`、`libsystemd.so`）。
+
+依赖闭包已在 xrpkg 之外解决时（例如手工缝合的 Arch 闭包），可用 `--no-deps` 只跳过预检；ABI 守门和事务发布仍会执行。
 
 ### Arch 仓库同步与安装
 
@@ -759,10 +780,14 @@ sudo chroot /tmp/xrpkg-root /bin/bash
 ```text
 src/
   main.rs        CLI 与命令分发
+  abi.rs         ELF GNU 符号版本与 GLIBC 基线校验
+  capability.rs  版本解析与包能力约束
   builder.rs     源码配方、沙箱、日志
   installer.rs   暂存、ABI 校验、升级事务
   fs_meta.rs     权限、属主、扩展属性与 PAX 解码
   transaction.rs 原子发布、快照、日志与崩溃恢复
+  uninstall.rs   基于数据库的精确卸载与空目录清理
+  world.rs       recipes/system.toml 编排（build-world）
   hooks.rs       生命周期 hooks 与 hook 沙箱
   repo.rs        仓库索引、缓存、下载、清理
   download.rs    统一下载与进度条
@@ -771,7 +796,9 @@ src/
   sync.rs        Arch core.db 同步与并发入库
   sign.rs        OpenPGP 分离签名
   state.rs       SQLite 状态
-  solver.rs      已选包类型
+  metadata.rs    场景/仓库 TOML 加载
+  deps_map.rs    外部依赖与 soname 映射
+  solver.rs      玩具求解器（resolvo 对照基线）
   resolvo_solver.rs 依赖求解
   xpkg.rs        .xpkg 读写与安全解包
   compat_*.rs    deb/rpm/arch 兼容轨道
@@ -795,6 +822,8 @@ var/             本地 SQLite 状态（已忽略）
 | `bash` | 5.2.21 |
 | `coreutils` | 9.4 |
 
+> ABI 守门基线是 `GLIBC_2.44`，但仓库内已提交的 glibc 配方构建的是 2.39。`repo/glibc-2.44.xpkg` 不是由这套配方产出的，当前无法从本仓库重建；见 `PROGRESS.md` 的“已知差距”。
+
 ### 测试
 
 ```sh
@@ -804,6 +833,8 @@ cargo fmt --check
 ```
 
 当前本地结果：**32 个测试目标、174 个测试通过**。部分测试需要 `unshare`、user namespace、`gpg`、`setcap`（root-only capability 用例）和 `zstd`。
+
+测试二进制共用 `~/.cache/xrpkg`，并行运行时偶发 `Text file busy`（ETXTBSY）。删除 `~/.cache/xrpkg/downloads/fetched-*` 后重跑即可；让每个测试使用独立缓存目录是已知的后续改进。
 
 ### 安全模型与边界
 
@@ -821,10 +852,13 @@ cargo fmt --check
 ### 限制
 
 - 尚未达到生产级。
+- ABI 基线是 `GLIBC_2.44`，但仓库内已提交的 glibc 配方构建的是 2.39；`repo/glibc-2.44.xpkg` 当前无法从本仓库重建。
 - LFS glibc/gcc 配方已包含并验证 configure；完整工具链构建耗时长且依赖硬件。
 - 兼容轨道会把外部包记录到 native 数据库，但不会重写其依赖元数据。
 - `sync` 不会自动签名仓库；执行 `xrpkg update` 前仍需走既有 `repo-sign` 流程。
 - 本阶段只同步 Arch/Pacman 生态，尚未实现 apt/dnf。
 - 仓库签名依赖系统 `gpg`。
+- 仓库内 `repo/xrpkg-repo.toml` 只索引了 `repo/` 的一部分产物；把它当完整索引前先用 `repo-add` 重新生成。
+- 测试共用 `~/.cache/xrpkg`，并行执行时可能相互干扰（见“测试”）。
 
 [English](#english)

@@ -4,16 +4,16 @@
 
 ---
 
-你接手的是 `xrpkg` 项目（阶段 30：跨生态仓库同步 + Arch 兼容安装 + 并发下载/进度条）。你的任务是**编译、验证并安装**，不是重新设计或扩展功能。
+你接手的是 `xrpkg` 项目（阶段 32：跨生态仓库同步 + Arch/XFCE 兼容安装 + 并发下载/进度条）。你的任务是**编译、验证并安装**，不是重新设计或扩展功能。
 
 ## 环境与位置
 
 - 仓库：`/home/zxtsd/xrpkg`（WSL Arch Linux 上的 ext4 路径；Windows 侧 UNC 为 `\\wsl.localhost\archlinux\home\zxtsd\xrpkg`，所有 cargo 命令应在 WSL 内执行）
-- 工具链：`cargo` / `rustc` 1.99（登录 shell 的 PATH 中可用；必要时用 `/home/zxtsd/.cargo/bin/cargo`）
+- 工具链：`cargo` / `rustc` 1.100（若提示 “no default toolchain is configured”，在命令前加 `RUSTUP_TOOLCHAIN=stable`，或执行 `rustup default stable`）
 - 构建依赖：C 工具链、`gpg`、`tar`、`gzip`、`zstd`、`unshare`
 - 网络：首次构建可能需要访问 crates.io；Arch 同步测试/实跑还需要访问镜像源
 - 目标架构：x86_64
-- 磁盘：完整 `cargo test` 的 `target/debug` 可能达到数 GB；release 二进制约 10 MiB。安装后可用 `rm -rf target/debug` 释放空间，但**不要未经用户同意执行 `cargo clean`**（它会删掉 release 产物）。
+- 磁盘：完整 `cargo test` 的 `target/debug` 可达十余 GB（本工作区实测约 18 GB）；release 二进制约 10 MiB。安装后可用 `rm -rf target/debug` 释放空间，但**不要未经用户同意执行 `cargo clean`**（它会删掉 release 产物）。
 
 ## 必读
 
@@ -49,9 +49,9 @@ CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo test
 
 - `cargo fmt --check` 通过；
 - `cargo clippy --all-targets -- -D warnings` 通过；
-- `cargo test`：27 个测试目标、131 个测试通过、0 失败。
+- `cargo test`：32 个测试目标、174 个测试通过、0 失败。
 
-如果 `source_fetch` 的 `detects_and_extracts_tar_xz_from_local_path` 报 `Text file busy`，这是共享构建缓存导致的既知环境抖动。先清理测试缓存再重跑：
+如果 `source_fetch` 的任一用例报 `Text file busy`（ETXTBSY），这是多个测试二进制并发共用 `~/.cache/xrpkg` 导致的既知环境抖动。先清理测试缓存再重跑：
 
 ```sh
 rm -f ~/.cache/xrpkg/downloads/fetched-gzip.tar.gz \
@@ -92,7 +92,7 @@ sudo install -Dm755 target/release/xrpkg /usr/local/bin/xrpkg
 
 **不要擅自修改 `/etc`、`/dev/nvme*`、XROS 的启动分区或现有 Rootfs。**
 
-### 5. 验证阶段 30 闭环（不访问网络）
+### 5. 验证阶段 32 闭环（不访问网络）
 
 这两个集成测试自带本地 mock 镜像和临时 GPG key，能验证同步、依赖过滤、ABI 拦截、Arch 包下载、软链接发布和 SQLite `origin='arch'`：
 
@@ -127,7 +127,7 @@ xrpkg sync 2>&1 | head -n 3
 ## 约束
 
 - 优先只编译/安装；发现编译或测试错误时，先定位并做**最小修复**，修完重新跑 fmt/clippy/test。
-- 不要借机重构、改架构、引入新依赖或改变阶段 30 的范围。
+- 不要借机重构、改架构、引入新依赖或改变阶段 32 的范围。
 - 不要执行破坏性命令，不要动用户的未提交文件。
 - 不要擅自签名、安装真实软件包或修改系统启动配置。
 - 所有临时验证都放在 `/tmp` 或测试自带的临时目录。
@@ -141,7 +141,7 @@ xrpkg sync 2>&1 | head -n 3
 2. `cargo fmt --check`、`cargo clippy`、`cargo test` 的实际结果（测试目标数、通过/失败数）；
 3. `target/release/xrpkg` 的路径和大小；
 4. 二进制安装位置，以及 `command -v xrpkg` 的结果；
-5. 两个阶段 30 集成测试的结果；
+5. 两个集成测试（`sync`、`install_arch_repo`）的结果；
 6. 遇到的任何警告/失败、是否做了最小修复；
 7. 如果没有执行真实镜像同步或 XROS 部署，明确说明原因和下一步需要用户确认什么。
 
@@ -150,11 +150,11 @@ xrpkg sync 2>&1 | head -n 3
 ## 可直接复制的短版
 
 ```text
-你接手 /home/zxtsd/xrpkg（xrpkg 阶段 30，WSL Arch，Rust 1.99）。请先读 AGENTS.md、README.md、PROGRESS.md，然后完成编译、验证和安装：
+你接手 /home/zxtsd/xrpkg（xrpkg 阶段 32，WSL Arch，Rust 1.100）。请先读 AGENTS.md、README.md、PROGRESS.md，然后完成编译、验证和安装：
 1) cd /home/zxtsd/xrpkg
 2) cargo fmt --check
 3) cargo clippy --all-targets -- -D warnings
-4) CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo test（期望 27 个测试目标、131 个测试通过；若 source_fetch 报 Text file busy，清理 ~/.cache/xrpkg/downloads/fetched-* 和 logs 后重跑）
+4) CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo test（期望 32 个测试目标、174 个测试通过；若 source_fetch 报 Text file busy，清理 ~/.cache/xrpkg/downloads/fetched-* 和 logs 后重跑）
 5) cargo build --release --locked
 6) install -Dm755 target/release/xrpkg ~/.local/bin/xrpkg
 7) cargo test --test sync -- --nocapture

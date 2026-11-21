@@ -6,6 +6,7 @@
 - [x] 阶段 27：内核排雷（强制内置 ext4/NVMe 驱动，修复 PARTUUID 启动问题）。
 - [x] 阶段 28：成功引导进入自建的 XROS beta1.0 系统。并使用兼容轨道白嫖了 Arch 的 systemd、NetworkManager、util-linux。
 - [x] 阶段 28.5：在 XROS 内部成功运行 xrpkg 二进制。
+- [x] 阶段 29.5、30、32：CLI 输出标准化与多语言、事务/元数据加固、XFCE/Xorg 兼容安装（阶段 31 仍在进行）。
 
 ## 当前架构环境
 - **宿主机**：VirtualBox 中的 Arch Linux（通过 VS Code Remote-SSH 连接）。
@@ -32,8 +33,22 @@
 - **XROS 实机**：通过挂载 `/dev/nvme0n1p3` 安装 `noto-fonts-cjk 20240730-1`（14 个 TTC，约 299 MiB），刷新 fontconfig 缓存；新构建的 `xrpkg` 部署到 `/usr/bin/xrpkg`，旧二进制备份为 `/usr/bin/xrpkg.old`。
 - **测试基线**：32 个测试目标、174 个测试通过，clippy `-D warnings` 与 `cargo fmt --check` 全绿；capability 用例在 root 下单独验证通过。
 
+## 阶段 32：XFCE/Xorg 兼容安装（实现已完成，XROS 端到端待验证）
+- **发布覆盖链接**：目标位置已有符号链接/硬链接时，只删除链接本身再创建新文件，绝不通过链接写穿到链接目标；目标为目录仍然拒绝覆盖。
+- **悬空符号链接**：允许包内符号链接先指向尚不存在的路径（由同批后续文件创建），但必须通过“最近的已存在祖先仍在 Rootfs 内”的检查，逃逸目标依旧拒绝。
+- **依赖闭包外置**：新增 `--no-deps`，用于依赖闭包已经在 xrpkg 之外解决（手工缝合 Arch 包）的场景；只跳过预检，ABI 守门和事务发布仍然执行。
+- **soname 映射**：`config/deps_map.toml` 增加 XFCE/Xorg 需要的 soname/虚拟依赖到 Arch 提供包的映射（glib2、libglvnd、systemd-libs、freetype2 等）。
+- **内核配方**：`recipes/linux.toml` 启用 DRM/VBOXVIDEO/VWMWFX 和 framebuffer console，内核模块安装到 `/usr/lib/modules`。
+- **测试**：新增 `publish_replaces_existing_file_with_hardlink`、`publish_replaces_symlinks_without_following_them`、`allows_dangling_symlink_target_for_later_package_files` 等用例；全量 174 个测试通过。
+
 ## 当前任务 (In Progress)
 **阶段 31：生产可用性收尾**
 - RPM 包头的 `%caps` 文本尚未转换为 `security.capability` 二进制；当前优先保证 Arch `.pkg.tar.zst` 与原生 `.xpkg` 的 capability 保真。
 - `Rootfs::prepare` 仍拒绝 `/`，真实系统写入需从宿主挂载目标分区后使用 `--root <挂载点>`；是否开放受控的 `--root /` 需要单独的安全设计。
 - 下一步补充真实断电注入、只读目标盘、并发 xrpkg 进程锁和安装后 `ldconfig`/fontconfig 钩子的回归测试。
+- 测试隔离：多个测试二进制并发共用 `~/.cache/xrpkg`，偶发 `Text file busy`（ETXTBSY）；清理 `~/.cache/xrpkg/downloads/fetched-*` 后可恢复，长期应改为每个测试使用独立缓存目录。
+
+## 已知差距 (Known Gaps)
+- 配方落后于基线：`recipes/glibc.toml` 仍是 2.39，`recipes/linux.toml` 是 6.7.4；`repo/glibc-2.44.xpkg` 存在，但无法用当前仓库内的配方重建。
+- `repo/xrpkg-repo.toml` 只索引了 `repo/` 的一部分产物（8 个包），与目录内容不同步；在重新生成索引前不要把它当作完整仓库清单。
+- 文档已于 2026-11-21 对齐到阶段 32；此前 `AGENTS.md` 的“仅标准库/禁止 resolvo”和旧测试计数均已修正。

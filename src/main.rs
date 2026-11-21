@@ -1,4 +1,4 @@
-//! 演示入口：Rootfs 初始化、内核/基础用户态构建、签名仓库安装/升级/降级/缓存清理、隔离构建、卸载/hooks，以及兼容轨道 .deb/.rpm/.pkg.tar.zst 的安装-记录-卸载闭环。
+//! xrpkg CLI 入口：Rootfs 初始化、内核/基础用户态构建、签名仓库安装/升级/降级/缓存清理、隔离构建、卸载/hooks，以及兼容轨道 .deb/.rpm/.pkg.tar.zst 的安装-记录-卸载闭环。
 
 use std::collections::HashMap;
 use std::fs;
@@ -12,7 +12,7 @@ use xrpkg::compat_arch;
 use xrpkg::compat_deb;
 use xrpkg::compat_rpm;
 use xrpkg::deps_map::{default_config_path, DependencyMapper};
-use xrpkg::hooks::{self, HookScript, POST_INSTALL, PRE_INSTALL};
+use xrpkg::hooks::{self, HookScript, POST_INSTALL, PRE_INSTALL, PRE_REMOVE};
 use xrpkg::installer;
 use xrpkg::metadata::load_repository;
 use xrpkg::mirrors;
@@ -22,19 +22,40 @@ use xrpkg::sign;
 use xrpkg::solver::{Package, SelectedPackage};
 use xrpkg::state::{InstalledPackage, LocalDb, PackageInstall};
 use xrpkg::sync;
+use xrpkg::transaction::{self, Transaction};
+use xrpkg::ui;
 use xrpkg::uninstall;
 use xrpkg::world;
 use xrpkg::xpkg::{self, Rootfs};
 
-/// 硬编码的本次安装目标，模拟 `install app`。
-const INSTALL_TARGET: &str = "app";
-
 /// 默认安装根目录；可以通过 `--root <dir>` 覆盖。
 const DEFAULT_ROOTFS: &str = "/var/tmp/xrpkg-rootfs";
 
+/// 恢复 Unix 默认的 SIGPIPE 行为。
+///
+/// Rust 运行时默认忽略 SIGPIPE，导致 `xrpkg --help | head` 这类管道在
+/// 读端提前关闭时触发 println! panic。恢复 SIG_DFL 后进程会像常规 CLI
+/// 一样安静退出，而不是打印 backtrace。
+#[cfg(unix)]
+fn restore_sigpipe() {
+    unsafe extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    const SIGPIPE: i32 = 13;
+    const SIG_DFL: usize = 0;
+    // SAFETY: SIG_DFL 是合法 handler；signal(2) 不访问 Rust 管理的状态。
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_sigpipe() {}
+
 fn main() {
+    restore_sigpipe();
     if let Err(error) = run() {
-        eprintln!("错误: {error}");
+        ui::error(&error);
         std::process::exit(1);
     }
 }
@@ -69,6 +90,9 @@ struct Cli {
     jobs: Option<usize>,
     init: bool,
     build_world: bool,
+    list: bool,
+    help: bool,
+    version: bool,
 }
 
 /// 在 Rootfs 中生成最小可启动/可 chroot 的基础配置文件。
@@ -152,27 +176,51 @@ fn parse_install_request(input: &str) -> Result<(String, Option<Version>), Strin
     let name = name.trim();
     let version_text = version_text.trim();
     if name.is_empty() {
-        return Err(format!("安装请求 `{input}` 缺少包名"));
+        return Err(ui::pick(
+            format!("安装请求 `{input}` 缺少包名"),
+            format!("Install request `{input}` is missing a package name"),
+        ));
     }
     if name
         .chars()
         .any(|character| character.is_whitespace() || matches!(character, '/' | '\\' | '='))
     {
-        return Err(format!("包名 `{name}` 非法"));
+        return Err(ui::pick(
+            format!("包名 `{name}` 非法"),
+            format!("Invalid package name `{name}`"),
+        ));
     }
     if version_text.is_empty() {
-        return Err(format!("安装请求 `{input}` 缺少版本"));
+        return Err(ui::pick(
+            format!("安装请求 `{input}` 缺少版本"),
+            format!("Install request `{input}` is missing a version"),
+        ));
     }
-    let version = Version::parse(version_text)
-        .map_err(|error| format!("安装请求 `{input}` 的版本非法: {error}"))?;
+    let version = Version::parse(version_text).map_err(|error| {
+        ui::pick(
+            format!("安装请求 `{input}` 的版本非法: {error}"),
+            format!("Invalid version in install request `{input}`: {error}"),
+        )
+    })?;
     Ok((name.to_string(), Some(version)))
 }
 
-/// 返回 `--db` 指定的数据库，否则使用项目内的 var/lib/xrpkg/local.db。
+/// 返回 `--db` 指定的数据库；否则根据二进制位置选择项目库或系统库。
 fn database_path(project_root: &Path, cli: &Cli) -> PathBuf {
-    cli.db
-        .clone()
-        .unwrap_or_else(|| project_root.join("var/lib/xrpkg/local.db"))
+    if let Some(db) = &cli.db {
+        return db.clone();
+    }
+    // 从构建目录内的二进制运行时沿用项目数据库；装进 /usr/bin 后自动使用
+    // 系统数据库，避免 `xrpkg list` 误读开发目录里的空库。
+    let project_db = project_root.join("var/lib/xrpkg/local.db");
+    let system_db = PathBuf::from("/var/lib/xrpkg/local.db");
+    match std::env::current_exe() {
+        Ok(exe) if exe.starts_with(project_root) => project_db,
+        Ok(_) => system_db,
+        // 没有 /proc 的最小 chroot 无法读取 current_exe；系统数据库存在时优先它。
+        Err(_) if system_db.is_file() => system_db,
+        Err(_) => project_db,
+    }
 }
 
 /// 返回 `--config` 指定的配置，否则使用 ~/.config/xrpkg/repos.toml。
@@ -210,9 +258,31 @@ fn run() -> Result<(), String> {
         + usize::from(cli.install.is_some())
         + usize::from(cli.sync.is_some())
         + usize::from(cli.sync_all)
-        + usize::from(cli.build_world);
+        + usize::from(cli.build_world)
+        + usize::from(cli.list);
+    if cli.help {
+        ui::print_help();
+        return Ok(());
+    }
+    if cli.version {
+        ui::print_version();
+        return Ok(());
+    }
     if action_count > 1 {
-        return Err("构建、卸载、仓库、同步和兼容轨道操作只能选择一个".to_string());
+        return Err(ui::pick(
+            "构建、卸载、仓库、同步和兼容轨道操作只能选择一个",
+            "Only one of build, remove, repository, sync, or compatibility operation may be selected",
+        ));
+    }
+    if action_count == 0 {
+        ui::print_help();
+        return Ok(());
+    }
+
+    if cli.list {
+        let db = LocalDb::open(database_path(project_root, &cli))?;
+        list(&db)?;
+        return Ok(());
     }
 
     if cli.build_world {
@@ -239,9 +309,6 @@ fn run() -> Result<(), String> {
             &database_path(project_root, &cli),
             &options,
         )?;
-        println!();
-        let db = LocalDb::open(database_path(project_root, &cli))?;
-        list(&db)?;
         return Ok(());
     }
 
@@ -257,7 +324,10 @@ fn run() -> Result<(), String> {
         let deps_map = default_config_path(project_root);
         if cli.sync_all {
             for mirror in mirrors::load(&mirrors_path)? {
-                println!("==> 同步镜像 {}: {}", mirror.name, mirror.url);
+                ui::phase(&ui::pick(
+                    format!("同步镜像 {}: {}", mirror.name, mirror.url),
+                    format!("Syncing mirror {}: {}", mirror.name, mirror.url),
+                ));
                 sync::sync_mirror_with_options(&mirror.url, &repo_dir, &deps_map, &options)?;
             }
         } else if let Some(target) = &cli.sync {
@@ -266,7 +336,10 @@ fn run() -> Result<(), String> {
             } else {
                 mirrors::resolve_target(&mirrors::load(&mirrors_path)?, target)?
             };
-            println!("==> 同步镜像: {url}");
+            ui::phase(&ui::pick(
+                format!("同步镜像: {url}"),
+                format!("Syncing mirror: {url}"),
+            ));
             sync::sync_mirror_with_options(&url, &repo_dir, &deps_map, &options)?;
         }
         return Ok(());
@@ -274,7 +347,10 @@ fn run() -> Result<(), String> {
 
     if let Some((key_id, file)) = &cli.repo_sign {
         let signature = sign::sign_detached(key_id, file)?;
-        println!("已生成签名: {}", signature.display());
+        ui::ok(&ui::pick(
+            format!("已生成签名: {}", signature.display()),
+            format!("Signature created: {}", signature.display()),
+        ));
         return Ok(());
     }
 
@@ -283,17 +359,27 @@ fn run() -> Result<(), String> {
             Some(key_id) => repo::repo_add_signed(repo_dir, package_path, key_id)?,
             None => repo::repo_add(repo_dir, package_path)?,
         };
-        println!(
-            "仓库索引已更新: {} ({} 个包)",
-            repo_dir.join("xrpkg-repo.toml").display(),
-            index.packages.len()
-        );
+        ui::ok(&ui::pick(
+            format!(
+                "仓库索引已更新: {} ({} 个包)",
+                repo_dir.join("xrpkg-repo.toml").display(),
+                index.packages.len()
+            ),
+            format!(
+                "Repository index updated: {} ({} packages)",
+                repo_dir.join("xrpkg-repo.toml").display(),
+                index.packages.len()
+            ),
+        ));
         return Ok(());
     }
 
     if cli.init {
         init_rootfs(&cli.rootfs)?;
-        println!("基础 Rootfs 配置已写入: {}", cli.rootfs.display());
+        ui::ok(&ui::pick(
+            format!("基础 Rootfs 配置已写入: {}", cli.rootfs.display()),
+            format!("Base root filesystem initialized: {}", cli.rootfs.display()),
+        ));
         return Ok(());
     }
     let cache_dir = cli
@@ -304,12 +390,21 @@ fn run() -> Result<(), String> {
         let config_path = resolve_config_path(&cli)?;
         let db = LocalDb::open(database_path(project_root, &cli))?;
         let report = repo::clean_cache(&config_path, &cache_dir, &db)?;
-        println!(
-            "缓存清理完成: 删除 {} 个包、{} 个签名，释放 {}",
-            report.packages,
-            report.signatures,
-            format_bytes(report.bytes)
-        );
+        ui::phase(ui::t("Cleaning cache", "清理缓存"));
+        ui::ok(&ui::pick(
+            format!(
+                "缓存清理完成: 删除 {} 个包、{} 个签名，释放 {}",
+                report.packages,
+                report.signatures,
+                format_bytes(report.bytes)
+            ),
+            format!(
+                "Cache cleaned: {} packages, {} signatures, {} freed",
+                report.packages,
+                report.signatures,
+                format_bytes(report.bytes)
+            ),
+        ));
         return Ok(());
     }
     if cli.update {
@@ -321,11 +416,27 @@ fn run() -> Result<(), String> {
         let config_path = resolve_config_path(&cli)?;
         let hits = repo::search(&config_path, &cache_dir, keyword)?;
         if hits.is_empty() {
-            println!("没有找到包含 `{keyword}` 的包");
+            ui::note(&ui::pick(
+                format!("没有找到包含 `{keyword}` 的包"),
+                format!("No packages matching `{keyword}`"),
+            ));
         } else {
-            for hit in hits {
-                println!("{}/{} {}", hit.repo, hit.name, hit.version);
-            }
+            ui::phase(&ui::pick(
+                format!("搜索 `{keyword}`: {} 个结果", hits.len()),
+                format!("Search `{keyword}`: {} result(s)", hits.len()),
+            ));
+            let rows = hits
+                .iter()
+                .map(|hit| [hit.repo.clone(), hit.name.clone(), hit.version.clone()])
+                .collect::<Vec<_>>();
+            ui::table(
+                [
+                    ui::t("Repository", "仓库"),
+                    ui::t("Package", "包"),
+                    ui::t("Version", "版本"),
+                ],
+                &rows,
+            );
         }
         return Ok(());
     }
@@ -336,7 +447,18 @@ fn run() -> Result<(), String> {
             let mut db = LocalDb::open(database_path(project_root, &cli))?;
             let installed = db.list_installed()?;
             let mapper = DependencyMapper::load_or_create(default_config_path(project_root))?;
-            if package_name.ends_with(".deb") {
+            if package_name.ends_with(".xpkg") {
+                install_local_xpkg(
+                    &mut db,
+                    requested_path,
+                    &cli.rootfs,
+                    &packages,
+                    &installed,
+                    cli.no_hooks,
+                    cli.no_deps,
+                    cli.allow_downgrade,
+                )?;
+            } else if package_name.ends_with(".deb") {
                 install_deb(
                     &mut db,
                     requested_path,
@@ -368,12 +490,15 @@ fn run() -> Result<(), String> {
                     cli.no_deps,
                 )?;
             } else {
-                return Err(format!(
-                    "无法识别外部包 `{package_name}`；支持 .deb、.rpm、.pkg.tar.zst"
+                return Err(ui::pick(
+                    format!(
+                        "无法识别外部包 `{package_name}`；支持 .xpkg、.deb、.rpm、.pkg.tar.zst"
+                    ),
+                    format!(
+                        "Unrecognized package `{package_name}`; expected .xpkg, .deb, .rpm, or .pkg.tar.zst"
+                    ),
                 ));
             }
-            println!();
-            list(&db)?;
             return Ok(());
         }
 
@@ -397,12 +522,20 @@ fn run() -> Result<(), String> {
             let packages = load_repository(project_root.join("packages.toml"))?;
             let installed = db.list_installed()?;
             let mapper = DependencyMapper::load_or_create(default_config_path(project_root))?;
-            println!(
-                "Arch 兼容包: {} {} ({})",
-                download.name,
-                download.version,
-                download.path.display()
-            );
+            ui::phase(&ui::pick(
+                format!(
+                    "Arch 兼容包: {} {} ({})",
+                    download.name,
+                    download.version,
+                    download.path.display()
+                ),
+                format!(
+                    "Arch compatibility package: {} {} ({})",
+                    download.name,
+                    download.version,
+                    download.path.display()
+                ),
+            ));
             install_arch(
                 &mut db,
                 &download.path,
@@ -414,8 +547,6 @@ fn run() -> Result<(), String> {
                 cli.no_deps,
             )?;
         }
-        println!();
-        list(&db)?;
         return Ok(());
     }
 
@@ -423,13 +554,30 @@ fn run() -> Result<(), String> {
         let mut db = LocalDb::open(database_path(project_root, &cli))?;
         let rootfs = Rootfs::prepare(&cli.rootfs)?;
         let report = uninstall::remove_package(&mut db, &rootfs, package_name, cli.no_hooks)?;
-        println!("卸载完成: {package_name}");
-        println!("删除文件: {}", report.removed_files);
-        println!("共享文件保留: {}", report.skipped_shared);
-        println!("已不存在: {}", report.missing);
-        println!("删除空目录: {}", report.removed_dirs);
-        println!();
-        list(&db)?;
+        ui::phase(&ui::pick(
+            format!("卸载 {package_name}"),
+            format!("Removing {package_name}"),
+        ));
+        ui::ok(&ui::pick(
+            format!("卸载完成: {package_name}"),
+            format!("Removal complete: {package_name}"),
+        ));
+        ui::note(&ui::pick(
+            format!("删除文件: {}", report.removed_files),
+            format!("Files removed: {}", report.removed_files),
+        ));
+        ui::note(&ui::pick(
+            format!("共享文件保留: {}", report.skipped_shared),
+            format!("Shared files kept: {}", report.skipped_shared),
+        ));
+        ui::note(&ui::pick(
+            format!("已不存在: {}", report.missing),
+            format!("Already absent: {}", report.missing),
+        ));
+        ui::note(&ui::pick(
+            format!("删除空目录: {}", report.removed_dirs),
+            format!("Empty directories removed: {}", report.removed_dirs),
+        ));
         return Ok(());
     }
 
@@ -488,17 +636,6 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    install(
-        &mut db,
-        &packages,
-        INSTALL_TARGET,
-        &project_root.join("repo"),
-        &cli.rootfs,
-        cli.no_hooks,
-        false,
-    )?;
-    println!();
-    list(&db)?;
     Ok(())
 }
 
@@ -532,6 +669,9 @@ fn parse_cli() -> Result<Cli, String> {
     let mut jobs = None;
     let mut init = false;
     let mut build_world = false;
+    let mut list = false;
+    let mut help = false;
+    let mut version = false;
     let mut arguments = std::env::args().skip(1).collect::<Vec<_>>();
 
     if !arguments.is_empty() {
@@ -539,7 +679,10 @@ fn parse_cli() -> Result<Cli, String> {
         match first.as_str() {
             "repo-add" => {
                 if arguments.len() < 2 {
-                    return Err("用法: xrpkg repo-add <repo_dir> <pkg.xpkg>".to_string());
+                    return Err(ui::pick(
+                        "用法: xrpkg repo-add <repo_dir> <pkg.xpkg>",
+                        "Usage: xrpkg repo-add <repo_dir> <pkg.xpkg>",
+                    ));
                 }
                 let repo_dir = PathBuf::from(arguments.remove(0));
                 let package = PathBuf::from(arguments.remove(0));
@@ -547,7 +690,10 @@ fn parse_cli() -> Result<Cli, String> {
             }
             "repo-sign" => {
                 if arguments.len() < 2 {
-                    return Err("用法: xrpkg repo-sign <key_id> <file>".to_string());
+                    return Err(ui::pick(
+                        "用法: xrpkg repo-sign <key_id> <file>",
+                        "Usage: xrpkg repo-sign <key_id> <file>",
+                    ));
                 }
                 let key_id = arguments.remove(0);
                 let file = PathBuf::from(arguments.remove(0));
@@ -557,21 +703,33 @@ fn parse_cli() -> Result<Cli, String> {
             "clean" => clean = true,
             "init" => init = true,
             "build-world" => build_world = true,
+            "list" => list = true,
+            "help" | "--help" | "-h" => help = true,
+            "version" | "--version" | "-V" => version = true,
             "search" => {
                 if arguments.is_empty() {
-                    return Err("用法: xrpkg search <keyword>".to_string());
+                    return Err(ui::pick(
+                        "用法: xrpkg search <keyword>",
+                        "Usage: xrpkg search <keyword>",
+                    ));
                 }
                 search = Some(arguments.remove(0));
             }
             "install" => {
                 if arguments.is_empty() {
-                    return Err("用法: xrpkg install <pkg_name>".to_string());
+                    return Err(ui::pick(
+                        "用法: xrpkg install <pkg_name>",
+                        "Usage: xrpkg install <package>",
+                    ));
                 }
                 install = Some(arguments.remove(0));
             }
             "sync" => {
                 if arguments.is_empty() {
-                    return Err("用法: xrpkg sync <url|mirror_name> | xrpkg sync --all".to_string());
+                    return Err(ui::pick(
+                        "用法: xrpkg sync <url|mirror_name> | xrpkg sync --all",
+                        "Usage: xrpkg sync <url|mirror_name> | xrpkg sync --all",
+                    ));
                 }
                 let value = arguments.remove(0);
                 if value.starts_with("--") {
@@ -591,25 +749,25 @@ fn parse_cli() -> Result<Cli, String> {
             "--root" => {
                 let value = arguments
                     .next()
-                    .ok_or_else(|| "`--root` 需要一个目录参数".to_string())?;
+                    .ok_or_else(|| ui::pick("`--root` 需要一个目录参数", "`--root` requires a directory"))?;
                 rootfs = PathBuf::from(value);
             }
             "--config" => {
                 let value = arguments
                     .next()
-                    .ok_or_else(|| "`--config` 需要一个 repos.toml 路径".to_string())?;
+                    .ok_or_else(|| ui::pick("`--config` 需要一个 repos.toml 路径", "`--config` requires a repos.toml path"))?;
                 config = Some(PathBuf::from(value));
             }
             "--mirrors" => {
                 let value = arguments
                     .next()
-                    .ok_or_else(|| "`--mirrors` 需要一个 mirrors.toml 路径".to_string())?;
+                    .ok_or_else(|| ui::pick("`--mirrors` 需要一个 mirrors.toml 路径", "`--mirrors` requires a mirrors.toml path"))?;
                 mirrors = Some(PathBuf::from(value));
             }
             "--repo-dir" => {
                 let value = arguments
                     .next()
-                    .ok_or_else(|| "`--repo-dir` 需要一个仓库目录".to_string())?;
+                    .ok_or_else(|| ui::pick("`--repo-dir` 需要一个仓库目录", "`--repo-dir` requires a repository directory"))?;
                 repo_dir = Some(PathBuf::from(value));
             }
             "--no-hooks" => no_hooks = true,
@@ -618,69 +776,76 @@ fn parse_cli() -> Result<Cli, String> {
             "--all" => sync_all = true,
             "--no-sandbox" => no_sandbox = true,
             "--no-deps" => no_deps = true,
+            "--help" | "-h" => help = true,
+            "--version" | "-V" => version = true,
             "--jobs" => {
                 let value = arguments
                     .next()
-                    .ok_or_else(|| "`--jobs` 需要一个正整数".to_string())?;
+                    .ok_or_else(|| ui::pick("`--jobs` 需要一个正整数", "`--jobs` requires a positive integer"))?;
                 let parsed = value
                     .parse::<usize>()
-                    .map_err(|_| format!("`--jobs` 的值 `{value}` 不是正整数"))?;
+                    .map_err(|_| ui::pick(format!("`--jobs` 的值 `{value}` 不是正整数"), format!("`--jobs` value `{value}` is not a positive integer")))?;
                 if parsed == 0 {
-                    return Err("`--jobs` 必须大于 0".to_string());
+                    return Err(ui::pick("`--jobs` 必须大于 0", "`--jobs` must be greater than 0"));
                 }
                 jobs = Some(parsed);
             }
             "--key" => {
                 let value = arguments
                     .next()
-                    .ok_or_else(|| "`--key` 需要一个 GPG key id".to_string())?;
+                    .ok_or_else(|| ui::pick("`--key` 需要一个 GPG key id", "`--key` requires a GPG key id"))?;
                 repo_add_key = Some(value);
             }
             "--db" => {
                 let value = arguments
                     .next()
-                    .ok_or_else(|| "`--db` 需要一个 SQLite 路径".to_string())?;
+                    .ok_or_else(|| ui::pick("`--db` 需要一个 SQLite 路径", "`--db` requires a SQLite path"))?;
                 db = Some(PathBuf::from(value));
             }
             "--cache" => {
                 let value = arguments
                     .next()
-                    .ok_or_else(|| "`--cache` 需要一个目录".to_string())?;
+                    .ok_or_else(|| ui::pick("`--cache` 需要一个目录", "`--cache` requires a directory"))?;
                 cache = Some(PathBuf::from(value));
             }
             "--deb" => {
                 let value = arguments
                     .next()
-                    .ok_or_else(|| "`--deb` 需要一个 .deb 文件路径".to_string())?;
+                    .ok_or_else(|| ui::pick("`--deb` 需要一个 .deb 文件路径", "`--deb` requires a .deb file path"))?;
                 deb = Some(PathBuf::from(value));
             }
             "--rpm" => {
                 let value = arguments
                     .next()
-                    .ok_or_else(|| "`--rpm` 需要一个 .rpm 文件路径".to_string())?;
+                    .ok_or_else(|| ui::pick("`--rpm` 需要一个 .rpm 文件路径", "`--rpm` requires a .rpm file path"))?;
                 rpm = Some(PathBuf::from(value));
             }
             "--arch" => {
                 let value = arguments
                     .next()
-                    .ok_or_else(|| "`--arch` 需要一个 .pkg.tar.zst 文件路径".to_string())?;
+                    .ok_or_else(|| ui::pick("`--arch` 需要一个 .pkg.tar.zst 文件路径", "`--arch` requires a .pkg.tar.zst file path"))?;
                 arch = Some(PathBuf::from(value));
             }
             "--build" => {
                 let value = arguments
                     .next()
-                    .ok_or_else(|| "`--build` 需要一个构建脚本路径".to_string())?;
+                    .ok_or_else(|| ui::pick("`--build` 需要一个构建脚本路径", "`--build` requires a recipe path"))?;
                 build = Some(PathBuf::from(value));
             }
             "--remove" => {
                 let value = arguments
                     .next()
-                    .ok_or_else(|| "`--remove` 需要一个包名".to_string())?;
+                    .ok_or_else(|| ui::pick("`--remove` 需要一个包名", "`--remove` requires a package name"))?;
                 remove = Some(value);
             }
             _ => {
-                return Err(format!(
-                    "未知参数 `{argument}`；支持 init/install/update/clean/search/sync/repo-add/repo-sign/build-world 子命令，或 `--root <dir>`、`--build <recipe>`、`--remove <pkg>`、`--deb <file>`、`--rpm <file>`、`--arch <file>`、`--config <file>`、`--mirrors <file>`、`--repo-dir <dir>`、`--cache <dir>`、`--key <gpg-key>`、`--allow-downgrade`、`--prefer-arch`、`--jobs <n>`、`--no-sandbox`、`--no-deps` 和 `--no-hooks`"
+                return Err(ui::pick(
+                    format!(
+                        "未知参数 `{argument}`；支持 init/install/update/clean/search/list/sync/repo-add/repo-sign/build-world 子命令，或 `--root <dir>`、`--build <recipe>`、`--remove <pkg>`、`--deb <file>`、`--rpm <file>`、`--arch <file>`、`--config <file>`、`--mirrors <file>`、`--repo-dir <dir>`、`--cache <dir>`、`--key <gpg-key>`、`--allow-downgrade`、`--prefer-arch`、`--jobs <n>`、`--no-sandbox`、`--no-deps` 和 `--no-hooks`"
+                    ),
+                    format!(
+                        "Unknown argument `{argument}`; use init/install/update/clean/search/list/sync/repo-add/repo-sign/build-world, or --root/--build/--remove/--deb/--rpm/--arch/--config/--mirrors/--repo-dir/--cache/--key/--allow-downgrade/--prefer-arch/--jobs/--no-sandbox/--no-deps/--no-hooks"
+                    ),
                 ))
             }
         }
@@ -715,6 +880,9 @@ fn parse_cli() -> Result<Cli, String> {
         jobs,
         init,
         build_world,
+        list,
+        help,
+        version,
     })
 }
 
@@ -736,7 +904,10 @@ fn build_and_install(
         &output_dir,
         builder::BuildOptions { sandbox, jobs },
     )?;
-    println!("生成 .xpkg: {}", archive.display());
+    ui::ok(&ui::pick(
+        format!("生成 .xpkg: {}", archive.display()),
+        format!("Created .xpkg: {}", archive.display()),
+    ));
 
     let metadata = xpkg::read_metadata(&archive)?;
     let mut packages = load_repository(project_root.join("packages.toml"))?;
@@ -758,8 +929,6 @@ fn build_and_install(
         no_hooks,
         allow_downgrade,
     )?;
-    println!();
-    list(&db)?;
     Ok(())
 }
 
@@ -788,19 +957,24 @@ fn commit_external_package(
     db.commit(&[install])
 }
 
+/// 外部包升级时需要保留的旧状态。
+struct ExternalUpgradeData {
+    old_files: Vec<String>,
+    old_hooks: Vec<HookScript>,
+    old_version_raw: String,
+}
+
 enum ExternalUpgrade {
     Fresh,
     AlreadyInstalled,
-    Upgrade(Vec<String>),
+    Upgrade(ExternalUpgradeData),
 }
 
-/// 外部包升级前处理：旧包 prerm，并返回旧文件清单。
-fn prepare_external_upgrade(
+/// 查询外部包是否是升级；不执行任何 hook 或文件操作。
+fn find_external_upgrade(
     db: &LocalDb,
     package_name: &str,
     new_version_raw: &str,
-    rootfs: &Rootfs,
-    no_hooks: bool,
 ) -> Result<ExternalUpgrade, String> {
     let Some(old) = db
         .list_installed()?
@@ -812,62 +986,103 @@ fn prepare_external_upgrade(
     if old.version_raw == new_version_raw {
         return Ok(ExternalUpgrade::AlreadyInstalled);
     }
-    let old_files = db.list_files(package_name)?;
-    if !no_hooks {
-        let hooks = db.list_hooks(package_name)?;
-        run_external_hooks(&hooks, "pre_remove", package_name, &old.version_raw, rootfs)?;
-    }
-    Ok(ExternalUpgrade::Upgrade(old_files))
+    Ok(ExternalUpgrade::Upgrade(ExternalUpgradeData {
+        old_files: db.list_files(package_name)?,
+        old_hooks: db.list_hooks(package_name)?,
+        old_version_raw: old.version_raw,
+    }))
 }
 
-/// 删除外部包旧版本有、新版本没有且未被共享的文件。
+/// 删除外部包旧版本有、新版本没有且未被共享的文件；返回提交后要清理的目录。
 fn remove_external_obsolete(
     db: &LocalDb,
+    transaction: &mut Transaction,
     package_name: &str,
     old_files: &[String],
     new_files: &[PathBuf],
-    rootfs: &Rootfs,
-) -> Result<(), String> {
+) -> Result<std::collections::BTreeSet<PathBuf>, String> {
     let new_files = new_files
         .iter()
         .map(|file| file.to_string_lossy().replace('\\', "/"))
         .collect::<std::collections::BTreeSet<_>>();
-    let mut directories = std::collections::BTreeSet::new();
+    let mut removed = Vec::new();
     for file in old_files {
         if new_files.contains(file) || db.file_claimed_by_other(package_name, file)? {
             continue;
         }
-        let target = rootfs.path().join(file);
-        match fs::symlink_metadata(&target) {
-            Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
-                fs::remove_file(&target).map_err(|error| {
-                    format!("删除废弃文件 `{}` 失败: {error}", target.display())
-                })?;
+        let relative = xpkg::sanitize_relative(Path::new(file))
+            .map_err(|error| format!("旧文件路径 `{file}` 非法: {error}"))?;
+        transaction.remove_file(&relative)?;
+        removed.push(relative);
+    }
+    Ok(transaction::parent_directories(removed))
+}
+
+/// 外部兼容包的统一提交阶段：事务化发布、升级快照、hook 和数据库提交。
+#[allow(clippy::too_many_arguments)]
+fn finish_external_install(
+    db: &mut LocalDb,
+    target: &Rootfs,
+    staging: &Rootfs,
+    name: &str,
+    version_raw: &str,
+    origin: &str,
+    files: &[PathBuf],
+    hooks: &[HookScript],
+    old: Option<ExternalUpgradeData>,
+    no_hooks: bool,
+) -> Result<(), String> {
+    let mut transaction = Transaction::begin(target, Some(db))?;
+    transaction.record_install(name, version_raw, origin)?;
+
+    let result = (|| -> Result<std::collections::BTreeSet<PathBuf>, String> {
+        if !no_hooks {
+            if let Some(old) = &old {
+                run_external_hooks(
+                    &old.old_hooks,
+                    PRE_REMOVE,
+                    name,
+                    &old.old_version_raw,
+                    target,
+                )?;
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("检查废弃文件 `{}` 失败: {error}", target.display())),
+            run_external_hooks(hooks, PRE_INSTALL, name, version_raw, target)?;
         }
-        let mut current = Path::new(file).parent();
-        while let Some(directory) = current {
-            if directory.as_os_str().is_empty() {
-                break;
-            }
-            directories.insert(directory.to_path_buf());
-            current = directory.parent();
+
+        let publish_paths = files
+            .iter()
+            .map(|file| file.to_string_lossy().replace('\\', "/"))
+            .collect::<Vec<_>>();
+        xpkg::publish_files_txn(&mut transaction, staging, &publish_paths)?;
+
+        let directories = if let Some(old) = &old {
+            remove_external_obsolete(db, &mut transaction, name, &old.old_files, files)?
+        } else {
+            std::collections::BTreeSet::new()
+        };
+
+        if !no_hooks {
+            run_external_hooks(hooks, POST_INSTALL, name, version_raw, target)?;
+        }
+
+        commit_external_package(db, name, version_raw, origin, files, hooks)?;
+        Ok(directories)
+    })();
+
+    match result {
+        Ok(directories) => {
+            transaction.commit();
+            let _ = transaction::remove_empty_directories(target.path(), &directories);
+            Ok(())
+        }
+        Err(error) => {
+            let rollback = transaction.rollback();
+            Err(match rollback {
+                Ok(()) => format!("{error}; 已回滚文件变更"),
+                Err(rollback_error) => format!("{error}; 回滚失败: {rollback_error}"),
+            })
         }
     }
-    let mut ordered = directories.into_iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|directory| std::cmp::Reverse(directory.components().count()));
-    for relative in ordered {
-        let directory = rootfs.path().join(relative);
-        if let Ok(mut entries) = fs::read_dir(&directory) {
-            if entries.next().is_none() {
-                let _ = fs::remove_dir(&directory);
-            }
-        }
-    }
-    Ok(())
 }
 
 /// 运行外部兼容包的某个 hook 阶段。
@@ -886,59 +1101,23 @@ fn run_external_hooks(
     Ok(())
 }
 
-/// post_install 失败时清理外部包已发布的文件。
-fn rollback_external_files(files: &[PathBuf], rootfs: &Rootfs) -> Result<(), String> {
-    let mut directories = std::collections::BTreeSet::new();
-    for file in files {
-        let target = rootfs.path().join(file);
-        match fs::symlink_metadata(&target) {
-            Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
-                fs::remove_file(&target)
-                    .map_err(|error| format!("回滚删除 `{}` 失败: {error}", target.display()))?;
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("回滚检查 `{}` 失败: {error}", target.display())),
-        }
-        let mut current = file.parent();
-        while let Some(directory) = current {
-            if directory.as_os_str().is_empty() {
-                break;
-            }
-            directories.insert(directory.to_path_buf());
-            current = directory.parent();
-        }
-    }
-    let mut ordered = directories.into_iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|directory| std::cmp::Reverse(directory.components().count()));
-    for relative in ordered {
-        let directory = rootfs.path().join(&relative);
-        if let Ok(mut entries) = fs::read_dir(&directory) {
-            if entries.next().is_none() {
-                let _ = fs::remove_dir(&directory);
-            }
-        }
-    }
-    Ok(())
-}
-
 /// 打印映射后的依赖并交给 resolvo 做可满足性预检。
 fn preflight_requirements(
     packages: &[Package],
     installed: &[InstalledPackage],
     requirements: &[Capability],
 ) -> Result<(), String> {
-    println!("依赖预检:");
+    ui::phase(ui::t("Dependency preflight", "依赖预检"));
     if requirements.is_empty() {
-        println!("  (无)");
+        ui::note(ui::t("(none)", "(无)"));
     } else {
         for requirement in requirements {
-            println!("  {requirement}");
+            ui::note(&requirement.to_string());
         }
     }
 
     resolvo_solver::resolve_requirements(packages, requirements, installed)?;
-    println!("依赖预检通过");
+    ui::ok(ui::t("Dependency preflight passed", "依赖预检通过"));
     Ok(())
 }
 
@@ -955,18 +1134,24 @@ fn install_arch(
     no_deps: bool,
 ) -> Result<(), String> {
     let metadata = compat_arch::parse_arch_metadata(arch_path)?;
-    println!("Arch 包: {} {}", metadata.pkgname, metadata.pkgver);
+    ui::phase(&ui::pick(
+        format!("Arch 包: {} {}", metadata.pkgname, metadata.pkgver),
+        format!("Arch package: {} {}", metadata.pkgname, metadata.pkgver),
+    ));
     if metadata.depends.is_empty() {
-        println!("依赖: (无)");
+        ui::note(ui::t("Dependencies: (none)", "依赖: (无)"));
     } else {
-        println!("依赖:");
+        ui::note(ui::t("Dependencies:", "依赖:"));
         for dependency in &metadata.depends {
-            println!("  {dependency}");
+            ui::note(dependency);
         }
     }
 
     if no_deps {
-        println!("依赖预检: 跳过（--no-deps）");
+        ui::note(ui::t(
+            "Dependency preflight: skipped (--no-deps)",
+            "依赖预检: 跳过（--no-deps）",
+        ));
     } else {
         let requirements = metadata.mapped_requirements(mapper)?;
         preflight_requirements(packages, installed, &requirements)?;
@@ -974,25 +1159,17 @@ fn install_arch(
 
     let hooks = compat_arch::read_arch_hooks(arch_path)?;
     let target = Rootfs::prepare(rootfs_path)?;
-    let old_files =
-        match prepare_external_upgrade(db, &metadata.pkgname, &metadata.pkgver, &target, no_hooks)?
-        {
-            ExternalUpgrade::Fresh => None,
-            ExternalUpgrade::AlreadyInstalled => {
-                println!("{} 已经安装，无需操作", metadata.pkgname);
-                return Ok(());
-            }
-            ExternalUpgrade::Upgrade(files) => Some(files),
-        };
-    if !no_hooks {
-        run_external_hooks(
-            &hooks,
-            PRE_INSTALL,
-            &metadata.pkgname,
-            &metadata.pkgver,
-            &target,
-        )?;
-    }
+    let old = match find_external_upgrade(db, &metadata.pkgname, &metadata.pkgver)? {
+        ExternalUpgrade::Fresh => None,
+        ExternalUpgrade::AlreadyInstalled => {
+            ui::note(&ui::pick(
+                format!("{} 已经安装，无需操作", metadata.pkgname),
+                format!("{} is already installed", metadata.pkgname),
+            ));
+            return Ok(());
+        }
+        ExternalUpgrade::Upgrade(data) => Some(data),
+    };
 
     let staging_dir = StagingDir::create()?;
     let staging = Rootfs::prepare(staging_dir.path())?;
@@ -1011,50 +1188,38 @@ fn install_arch(
         abi_guard.check_file(&metadata.pkgname, &relative, &staged)?;
     }
 
-    let publish_paths = files
-        .iter()
-        .map(|file| file.to_string_lossy().replace('\\', "/"))
-        .collect::<Vec<_>>();
-    xpkg::publish_files(&staging, &target, &publish_paths)?;
-
-    if let Some(old_files) = &old_files {
-        remove_external_obsolete(db, &metadata.pkgname, old_files, &files, &target)?;
-    }
-
-    if !no_hooks {
-        if let Err(error) = run_external_hooks(
-            &hooks,
-            POST_INSTALL,
-            &metadata.pkgname,
-            &metadata.pkgver,
-            &target,
-        ) {
-            let rollback = rollback_external_files(&files, &target);
-            return Err(match rollback {
-                Ok(()) => format!("{error}; 已回滚已发布的文件"),
-                Err(rollback_error) => format!("{error}; 回滚失败: {rollback_error}"),
-            });
-        }
-    }
-
-    commit_external_package(
+    finish_external_install(
         db,
+        &target,
+        &staging,
         &metadata.pkgname,
         &metadata.pkgver,
         "arch",
         &files,
         &hooks,
+        old,
+        no_hooks,
     )?;
 
-    println!(
-        "ABI 校验通过（GLIBC 基线 {MAX_GLIBC_VERSION}），发布到 {}",
-        target.path().display()
-    );
-    println!("安装文件 ({}):", files.len());
-    for file in &files {
-        println!("{}", file.display());
-    }
-    println!("兼容轨道：已写入 installed_packages/installed_files 和 installed_hooks");
+    ui::ok(&ui::pick(
+        format!(
+            "ABI 校验通过（GLIBC 基线 {MAX_GLIBC_VERSION}），发布到 {}",
+            target.path().display()
+        ),
+        format!(
+            "ABI check passed (GLIBC baseline {MAX_GLIBC_VERSION}); published to {}",
+            target.path().display()
+        ),
+    ));
+    let file_count = ui::count(files.len(), "file", "files", "个文件");
+    ui::note(&ui::pick(
+        format!("安装文件 ({file_count})"),
+        format!("Files installed: {file_count}"),
+    ));
+    ui::ok(ui::t(
+        "Compatibility track: recorded in installed_packages/installed_files/installed_hooks; origin [arch]",
+        "兼容轨道：已写入 installed_packages/installed_files 和 installed_hooks；来源 [arch]",
+    ));
     Ok(())
 }
 
@@ -1075,16 +1240,22 @@ fn install_rpm(
         .epoch
         .map(|epoch| format!("{epoch}:"))
         .unwrap_or_default();
-    println!(
-        "RPM 包: {} {}{}-{}",
-        metadata.name, epoch, metadata.version, metadata.release
-    );
+    ui::phase(&ui::pick(
+        format!(
+            "RPM 包: {} {}{}-{}",
+            metadata.name, epoch, metadata.version, metadata.release
+        ),
+        format!(
+            "RPM package: {} {}{}-{}",
+            metadata.name, epoch, metadata.version, metadata.release
+        ),
+    ));
     if metadata.requires.is_empty() {
-        println!("Requires: (无)");
+        ui::note(ui::t("Requires: (none)", "Requires: (无)"));
     } else {
-        println!("Requires:");
+        ui::note(ui::t("Requires:", "Requires:"));
         for requirement in &metadata.requires {
-            println!("  {requirement}");
+            ui::note(requirement);
         }
     }
 
@@ -1104,52 +1275,50 @@ fn install_rpm(
     let hooks = compat_rpm::read_rpm_hooks(rpm_path)?;
     let target = Rootfs::prepare(rootfs_path)?;
     let hook_version = format!("{}{}-{}", epoch, metadata.version, metadata.release);
-    let old_files =
-        match prepare_external_upgrade(db, &metadata.name, &hook_version, &target, no_hooks)? {
-            ExternalUpgrade::Fresh => None,
-            ExternalUpgrade::AlreadyInstalled => {
-                println!("{} 已经安装，无需操作", metadata.name);
-                return Ok(());
-            }
-            ExternalUpgrade::Upgrade(files) => Some(files),
-        };
-    if !no_hooks {
-        run_external_hooks(&hooks, PRE_INSTALL, &metadata.name, &hook_version, &target)?;
-    }
-
-    let publish_paths = files
-        .iter()
-        .map(|file| file.to_string_lossy().replace('\\', "/"))
-        .collect::<Vec<_>>();
-    xpkg::publish_files(&staging, &target, &publish_paths)?;
-
-    if let Some(old_files) = &old_files {
-        remove_external_obsolete(db, &metadata.name, old_files, &files, &target)?;
-    }
-
-    if !no_hooks {
-        if let Err(error) =
-            run_external_hooks(&hooks, POST_INSTALL, &metadata.name, &hook_version, &target)
-        {
-            let rollback = rollback_external_files(&files, &target);
-            return Err(match rollback {
-                Ok(()) => format!("{error}; 已回滚已发布的文件"),
-                Err(rollback_error) => format!("{error}; 回滚失败: {rollback_error}"),
-            });
+    let old = match find_external_upgrade(db, &metadata.name, &hook_version)? {
+        ExternalUpgrade::Fresh => None,
+        ExternalUpgrade::AlreadyInstalled => {
+            ui::note(&ui::pick(
+                format!("{} 已经安装，无需操作", metadata.name),
+                format!("{} is already installed", metadata.name),
+            ));
+            return Ok(());
         }
-    }
+        ExternalUpgrade::Upgrade(data) => Some(data),
+    };
 
-    commit_external_package(db, &metadata.name, &hook_version, "rpm", &files, &hooks)?;
+    finish_external_install(
+        db,
+        &target,
+        &staging,
+        &metadata.name,
+        &hook_version,
+        "rpm",
+        &files,
+        &hooks,
+        old,
+        no_hooks,
+    )?;
 
-    println!(
-        "ABI 校验通过（GLIBC 基线 {MAX_GLIBC_VERSION}），发布到 {}",
-        target.path().display()
-    );
-    println!("安装文件 ({}):", files.len());
-    for file in &files {
-        println!("{}", file.display());
-    }
-    println!("兼容轨道：已写入 installed_packages/installed_files 和 installed_hooks");
+    ui::ok(&ui::pick(
+        format!(
+            "ABI 校验通过（GLIBC 基线 {MAX_GLIBC_VERSION}），发布到 {}",
+            target.path().display()
+        ),
+        format!(
+            "ABI check passed (GLIBC baseline {MAX_GLIBC_VERSION}); published to {}",
+            target.path().display()
+        ),
+    ));
+    let file_count = ui::count(files.len(), "file", "files", "个文件");
+    ui::note(&ui::pick(
+        format!("安装文件 ({file_count})"),
+        format!("Files installed: {file_count}"),
+    ));
+    ui::ok(ui::t(
+        "Compatibility track: recorded in installed_packages/installed_files/installed_hooks; origin [arch]",
+        "兼容轨道：已写入 installed_packages/installed_files 和 installed_hooks；来源 [arch]",
+    ));
     Ok(())
 }
 
@@ -1167,8 +1336,17 @@ fn install_deb(
     no_hooks: bool,
 ) -> Result<(), String> {
     let metadata = compat_deb::parse_deb_metadata(deb_path)?;
-    println!("Debian 包: {} {}", metadata.package, metadata.version);
-    println!("Depends: {}", metadata.depends.as_deref().unwrap_or("(无)"));
+    ui::phase(&ui::pick(
+        format!("Debian 包: {} {}", metadata.package, metadata.version),
+        format!("Debian package: {} {}", metadata.package, metadata.version),
+    ));
+    ui::note(&ui::pick(
+        format!("Depends: {}", metadata.depends.as_deref().unwrap_or("(无)")),
+        format!(
+            "Depends: {}",
+            metadata.depends.as_deref().unwrap_or("(none)")
+        ),
+    ));
 
     let requirements = metadata.mapped_requirements(mapper)?;
     preflight_requirements(packages, installed, &requirements)?;
@@ -1185,75 +1363,117 @@ fn install_deb(
 
     let hooks = compat_deb::read_deb_hooks(deb_path)?;
     let target = Rootfs::prepare(rootfs_path)?;
-    let old_files = match prepare_external_upgrade(
-        db,
-        &metadata.package,
-        &metadata.version,
-        &target,
-        no_hooks,
-    )? {
+    let old = match find_external_upgrade(db, &metadata.package, &metadata.version)? {
         ExternalUpgrade::Fresh => None,
         ExternalUpgrade::AlreadyInstalled => {
-            println!("{} 已经安装，无需操作", metadata.package);
+            ui::note(&ui::pick(
+                format!("{} 已经安装，无需操作", metadata.package),
+                format!("{} is already installed", metadata.package),
+            ));
             return Ok(());
         }
-        ExternalUpgrade::Upgrade(files) => Some(files),
+        ExternalUpgrade::Upgrade(data) => Some(data),
     };
-    if !no_hooks {
-        run_external_hooks(
-            &hooks,
-            PRE_INSTALL,
-            &metadata.package,
-            &metadata.version,
-            &target,
-        )?;
-    }
 
-    let publish_paths = files
-        .iter()
-        .map(|file| file.to_string_lossy().replace('\\', "/"))
-        .collect::<Vec<_>>();
-    xpkg::publish_files(&staging, &target, &publish_paths)?;
-
-    if let Some(old_files) = &old_files {
-        remove_external_obsolete(db, &metadata.package, old_files, &files, &target)?;
-    }
-
-    if !no_hooks {
-        if let Err(error) = run_external_hooks(
-            &hooks,
-            POST_INSTALL,
-            &metadata.package,
-            &metadata.version,
-            &target,
-        ) {
-            let rollback = rollback_external_files(&files, &target);
-            return Err(match rollback {
-                Ok(()) => format!("{error}; 已回滚已发布的文件"),
-                Err(rollback_error) => format!("{error}; 回滚失败: {rollback_error}"),
-            });
-        }
-    }
-
-    commit_external_package(
+    finish_external_install(
         db,
+        &target,
+        &staging,
         &metadata.package,
         &metadata.version,
         "deb",
         &files,
         &hooks,
+        old,
+        no_hooks,
     )?;
 
-    println!(
-        "ABI 校验通过（GLIBC 基线 {MAX_GLIBC_VERSION}），发布到 {}",
-        target.path().display()
-    );
-    println!("安装文件 ({}):", files.len());
-    for file in &files {
-        println!("{}", file.display());
-    }
-    println!("兼容轨道：已写入 installed_packages/installed_files 和 installed_hooks");
+    ui::ok(&ui::pick(
+        format!(
+            "ABI 校验通过（GLIBC 基线 {MAX_GLIBC_VERSION}），发布到 {}",
+            target.path().display()
+        ),
+        format!(
+            "ABI check passed (GLIBC baseline {MAX_GLIBC_VERSION}); published to {}",
+            target.path().display()
+        ),
+    ));
+    let file_count = ui::count(files.len(), "file", "files", "个文件");
+    ui::note(&ui::pick(
+        format!("安装文件 ({file_count})"),
+        format!("Files installed: {file_count}"),
+    ));
+    ui::ok(ui::t(
+        "Compatibility track: recorded in installed_packages/installed_files/installed_hooks; origin [arch]",
+        "兼容轨道：已写入 installed_packages/installed_files 和 installed_hooks；来源 [arch]",
+    ));
     Ok(())
+}
+
+/// 直接安装本地 `.xpkg`：校验元数据、预检依赖，再走统一的 ABI 与事务提交。
+#[allow(clippy::too_many_arguments)]
+fn install_local_xpkg(
+    db: &mut LocalDb,
+    archive: &Path,
+    rootfs_path: &Path,
+    packages: &[Package],
+    installed: &[InstalledPackage],
+    no_hooks: bool,
+    no_deps: bool,
+    allow_downgrade: bool,
+) -> Result<(), String> {
+    let metadata = xpkg::read_metadata(archive)?;
+    ui::phase(&ui::pick(
+        format!(
+            "本地 .xpkg: {} {} ({})",
+            metadata.name,
+            metadata.version,
+            archive.display()
+        ),
+        format!(
+            "Local .xpkg: {} {} ({})",
+            metadata.name,
+            metadata.version,
+            archive.display()
+        ),
+    ));
+
+    if installed.iter().any(|package| {
+        package.name == metadata.name && package.version_raw == metadata.version.to_string()
+    }) {
+        ui::note(&ui::pick(
+            format!("{} 已经安装，无需操作", metadata.name),
+            format!("{} is already installed", metadata.name),
+        ));
+        return Ok(());
+    }
+
+    if no_deps {
+        ui::note(ui::t(
+            "Dependency preflight: skipped (--no-deps)",
+            "依赖预检: 跳过（--no-deps）",
+        ));
+    } else {
+        preflight_requirements(packages, installed, &metadata.requires)?;
+    }
+
+    let selected = SelectedPackage {
+        name: metadata.name.clone(),
+        version: metadata.version.clone(),
+    };
+    let mut archives = HashMap::new();
+    archives.insert(
+        (selected.name.clone(), selected.version.clone()),
+        archive.to_path_buf(),
+    );
+    installer::install_changes(
+        db,
+        &[selected],
+        &archives,
+        rootfs_path,
+        no_hooks,
+        allow_downgrade,
+    )
 }
 
 /// 模拟 `install <pkg_name>`：求解增量计划，然后进入带 ABI 守门的提交阶段。
@@ -1270,14 +1490,19 @@ fn install(
     let resolution = resolvo_solver::resolve_install_latest(packages, requested, &installed)?;
     let changes = incremental_plan(&resolution, &installed);
     if changes.is_empty() {
-        println!("{requested} 已经安装，无需操作");
+        ui::note(&ui::pick(
+            format!("{requested} 已经安装，无需操作"),
+            format!("{requested} is already installed"),
+        ));
         return Ok(());
     }
 
-    println!("安装计划:");
-    for package in &changes {
-        println!("{} {}", package.name, package.version);
-    }
+    ui::phase(ui::t("Install plan", "安装计划"));
+    let rows = changes
+        .iter()
+        .map(|package| [package.name.clone(), package.version.to_string()])
+        .collect::<Vec<_>>();
+    ui::table2([ui::t("Package", "包"), ui::t("Version", "版本")], &rows);
 
     let mut archives = HashMap::new();
     for package in &changes {
@@ -1341,17 +1566,28 @@ fn package_archive_path(repo_dir: &Path, package: &SelectedPackage) -> Result<Pa
 /// 模拟 `list`：按包名排序列出数据库中的已安装包。
 fn list(db: &LocalDb) -> Result<(), String> {
     let installed = db.list_installed()?;
-    println!("已安装包:");
-    if installed.is_empty() {
-        println!("(空)");
-    } else {
-        for package in &installed {
-            println!(
-                "{} {} [{}]",
-                package.name, package.version_raw, package.origin
-            );
-        }
-    }
+    ui::phase(&ui::pick(
+        format!("已安装包: {}", installed.len()),
+        format!("Installed packages: {}", installed.len()),
+    ));
+    let rows = installed
+        .iter()
+        .map(|package| {
+            [
+                package.name.clone(),
+                package.version_raw.clone(),
+                format!("[{}]", package.origin),
+            ]
+        })
+        .collect::<Vec<_>>();
+    ui::table(
+        [
+            ui::t("Name", "名称"),
+            ui::t("Version", "版本"),
+            ui::t("Origin", "来源"),
+        ],
+        &rows,
+    );
     Ok(())
 }
 

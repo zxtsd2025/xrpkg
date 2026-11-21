@@ -5,6 +5,7 @@
 //! [mappings]
 //! "libssl3" = "openssl >= 3.0"
 //! ```
+use crate::ui;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -84,7 +85,7 @@ impl DependencyMapper {
             mapped.to_string()
         } else {
             if warn_unmapped {
-                eprintln!("warning: 外部依赖 `{external_cap}` 没有映射，保留原依赖名");
+                ui::warn(&ui::pick(format!("外部依赖 `{external_cap}` 没有映射，保留原依赖名"), format!("External dependency `{external_cap}` is not mapped; keeping its original name")));
             }
             external_cap.to_string()
         }
@@ -102,9 +103,10 @@ impl DependencyMapper {
             Err(error) => {
                 let source_name = external_dependency_name(external_cap);
                 if mapped != external_cap {
-                    eprintln!(
-                        "warning: 依赖 `{external_cap}` 的映射 `{mapped}` 不是合法 Capability（{error}），回退到源包名 `{source_name}`"
-                    );
+                    ui::warn(&ui::pick(
+                        format!("依赖 `{external_cap}` 的映射 `{mapped}` 不是合法 Capability（{error}），回退到源包名 `{source_name}`"),
+                        format!("Mapping `{mapped}` for `{external_cap}` is not a valid capability ({error}); falling back to source name `{source_name}`"),
+                    ));
                 }
                 Capability::parse(source_name).map_err(|fallback_error| {
                     format!(

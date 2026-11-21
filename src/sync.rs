@@ -26,6 +26,7 @@ use crate::compat_arch::verify_arch_abi;
 use crate::deps_map::DependencyMapper;
 use crate::download;
 use crate::repo::{self, RepoPackage};
+use crate::ui;
 
 /// 本模块使用的错误类型；当前统一用可读字符串。
 pub type Error = String;
@@ -130,7 +131,10 @@ pub fn sync_mirror_with_options(
     let baseline = SystemBaseline::xros()?;
     let guard = AbiGuard::new(MAX_GLIBC_VERSION)?;
     let entries = load_arch_entries(mirror_url)?;
-    println!("==> Arch 数据库条目: {}", entries.len());
+    ui::phase(&ui::pick(
+        format!("Arch 数据库条目: {}", entries.len()),
+        format!("Arch database entries: {}", entries.len()),
+    ));
 
     fs::create_dir_all(repo_dir)
         .map_err(|error| format!("创建本地仓库目录 `{}` 失败: {error}", repo_dir.display()))?;
@@ -141,17 +145,26 @@ pub fn sync_mirror_with_options(
         let dependencies = match map_dependencies(&entry.depends, &mapper) {
             Ok(dependencies) => dependencies,
             Err(error) => {
-                eprintln!("warning: 跳过包 {} {}：{error}", entry.name, entry.version);
+                ui::warn(&ui::pick(
+                    format!("跳过包 {} {}：{error}", entry.name, entry.version),
+                    format!("Skipping package {} {}: {error}", entry.name, entry.version),
+                ));
                 report.failed += 1;
                 continue;
             }
         };
 
         if let Some((source, mapped)) = first_unsatisfied(&dependencies, &baseline) {
-            eprintln!(
-                "warning: 跳过包 {} {}：依赖 `{source}` 映射为 `{mapped}`，无法由 XROS 基线满足",
-                entry.name, entry.version
-            );
+            ui::warn(&ui::pick(
+                format!(
+                    "跳过包 {} {}：依赖 `{source}` 映射为 `{mapped}`，无法由 XROS 基线满足",
+                    entry.name, entry.version
+                ),
+                format!(
+                    "Skipping package {} {}: dependency `{source}` maps to `{mapped}`, not satisfied by the XROS baseline",
+                    entry.name, entry.version
+                ),
+            ));
             report.skipped_dependencies += 1;
             continue;
         }
@@ -165,15 +178,24 @@ pub fn sync_mirror_with_options(
 
     let total = candidates.len();
     if total == 0 {
-        println!(
-            "同步完成: 收录 0，依赖跳过 {}，ABI 拦截 0，失败 {}",
-            report.skipped_dependencies, report.failed
-        );
+        ui::ok(&ui::pick(
+            format!(
+                "同步完成: 收录 0，依赖跳过 {}，ABI 拦截 0，失败 {}",
+                report.skipped_dependencies, report.failed
+            ),
+            format!(
+                "Sync complete: 0 added, {} dependency skips, 0 ABI rejects, {} failed",
+                report.skipped_dependencies, report.failed
+            ),
+        ));
         return Ok(report);
     }
 
     let workers = options.jobs.max(1).min(total);
-    println!("==> 并发下载 {total} 个包（{workers} 个线程）");
+    ui::phase(&ui::pick(
+        format!("并发下载 {total} 个包（{workers} 个线程）"),
+        format!("Downloading {total} package(s) with {workers} worker(s)"),
+    ));
     let results = download_candidates(mirror_url, repo_dir, &candidates, &guard, workers);
 
     let mut indexed = Vec::with_capacity(total);
@@ -181,15 +203,24 @@ pub fn sync_mirror_with_options(
         match &results[position] {
             Some(Ok(success)) => {
                 if success.missing_sha {
-                    eprintln!(
-                        "warning: 包 {} 的 desc 缺少 SHA256SUM，记录下载后实测哈希",
-                        entry.filename
-                    );
+                    ui::warn(&ui::pick(
+                        format!(
+                            "包 {} 的 desc 缺少 SHA256SUM，记录下载后实测哈希",
+                            entry.filename
+                        ),
+                        format!(
+                            "Package {} has no SHA256SUM in desc; recording measured hash",
+                            entry.filename
+                        ),
+                    ));
                 }
-                println!(
-                    "==> 收录 {} {} ({})",
-                    entry.name, entry.version, entry.filename
-                );
+                ui::step(&ui::pick(
+                    format!("收录 {} {} ({})", entry.name, entry.version, entry.filename),
+                    format!(
+                        "Indexed {} {} ({})",
+                        entry.name, entry.version, entry.filename
+                    ),
+                ));
                 indexed.push(RepoPackage {
                     name: entry.name,
                     version: entry.version,
@@ -201,21 +232,30 @@ pub fn sync_mirror_with_options(
                 report.synced += 1;
             }
             Some(Err(IngestError::Abi(error))) => {
-                eprintln!(
-                    "warning: ABI 拦截包 {} {}：{error}",
-                    entry.name, entry.version
-                );
+                ui::warn(&ui::pick(
+                    format!("ABI 拦截包 {} {}：{error}", entry.name, entry.version),
+                    format!(
+                        "ABI rejected package {} {}: {error}",
+                        entry.name, entry.version
+                    ),
+                ));
                 report.skipped_abi += 1;
             }
             Some(Err(IngestError::Other(error))) => {
-                eprintln!("warning: 跳过包 {} {}：{error}", entry.name, entry.version);
+                ui::warn(&ui::pick(
+                    format!("跳过包 {} {}：{error}", entry.name, entry.version),
+                    format!("Skipping package {} {}: {error}", entry.name, entry.version),
+                ));
                 report.failed += 1;
             }
             None => {
-                eprintln!(
-                    "warning: 包 {} {} 没有返回下载结果",
-                    entry.name, entry.version
-                );
+                ui::warn(&ui::pick(
+                    format!("包 {} {} 没有返回下载结果", entry.name, entry.version),
+                    format!(
+                        "Package {} {} produced no download result",
+                        entry.name, entry.version
+                    ),
+                ));
                 report.failed += 1;
             }
         }
@@ -223,17 +263,30 @@ pub fn sync_mirror_with_options(
 
     if !indexed.is_empty() {
         let index = repo::add_index_entries(repo_dir, &indexed)?;
-        println!(
-            "==> 仓库索引已更新: {} ({} 个包)",
-            repo_dir.join("xrpkg-repo.toml").display(),
-            index.packages.len()
-        );
+        ui::ok(&ui::pick(
+            format!(
+                "仓库索引已更新: {} ({} 个包)",
+                repo_dir.join("xrpkg-repo.toml").display(),
+                index.packages.len()
+            ),
+            format!(
+                "Repository index updated: {} ({} packages)",
+                repo_dir.join("xrpkg-repo.toml").display(),
+                index.packages.len()
+            ),
+        ));
     }
 
-    println!(
-        "同步完成: 收录 {}，依赖跳过 {}，ABI 拦截 {}，失败 {}",
-        report.synced, report.skipped_dependencies, report.skipped_abi, report.failed
-    );
+    ui::ok(&ui::pick(
+        format!(
+            "同步完成: 收录 {}，依赖跳过 {}，ABI 拦截 {}，失败 {}",
+            report.synced, report.skipped_dependencies, report.skipped_abi, report.failed
+        ),
+        format!(
+            "Sync complete: {} added, {} dependency skips, {} ABI rejects, {} failed",
+            report.synced, report.skipped_dependencies, report.skipped_abi, report.failed
+        ),
+    ));
     Ok(report)
 }
 
@@ -282,7 +335,10 @@ fn download_candidates(
 /// 下载并解析 `<mirror>/core.db`。
 fn load_arch_entries(mirror_url: &str) -> Result<Vec<ArchRepoEntry>, Error> {
     let url = download::join_location(mirror_url, DB_FILENAME)?;
-    println!("==> 读取 Arch 数据库: {url}");
+    ui::phase(&ui::pick(
+        format!("读取 Arch 数据库: {url}"),
+        format!("Reading Arch database: {url}"),
+    ));
     let bytes = download::read_all(&url)?;
     parse_core_db(&bytes)
 }

@@ -3,12 +3,11 @@
 //! 只删除数据库记录中属于该包的路径；共享文件保留，空目录自底向上清理。
 
 use std::collections::BTreeSet;
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::hooks::{self, POST_REMOVE, PRE_REMOVE};
 use crate::state::LocalDb;
+use crate::transaction::{self, Transaction};
 use crate::xpkg::{sanitize_relative, Rootfs};
 
 /// 一次卸载的结果统计。
@@ -42,6 +41,29 @@ pub fn remove_package(
         .find(|package| package.name == package_name)
         .map(|package| package.version_raw)
         .unwrap_or_default();
+
+    // 防呆：如果该包独占的文件一个都不存在，极可能是 --root 指向了错误的
+    // Rootfs。此时绝不能只删数据库记录，让真实系统文件变成“孤儿”。
+    let mut owned = 0usize;
+    let mut present = 0usize;
+    for file in &files {
+        if db.file_claimed_by_other(package_name, file)? {
+            continue;
+        }
+        owned += 1;
+        let relative = sanitize_relative(Path::new(file))
+            .map_err(|error| format!("数据库中的文件路径 `{file}` 非法: {error}"))?;
+        if std::fs::symlink_metadata(rootfs.path().join(&relative)).is_ok() {
+            present += 1;
+        }
+    }
+    if owned > 0 && present == 0 {
+        return Err(format!(
+            "目标 Rootfs `{}` 中找不到包 `{package_name}` 的任何独占文件；拒绝只删除数据库记录，请检查 --root",
+            rootfs.path().display()
+        ));
+    }
+
     if !no_hooks {
         for hook in &hooks {
             if hook.phase == PRE_REMOVE {
@@ -51,6 +73,8 @@ pub fn remove_package(
     }
     let mut report = RemoveReport::default();
     let mut directories = BTreeSet::new();
+    let mut transaction = Transaction::begin(rootfs, Some(db))?;
+    transaction.record_remove(package_name)?;
 
     for file in &files {
         let relative = sanitize_relative(Path::new(file))
@@ -61,84 +85,49 @@ pub fn remove_package(
             continue;
         }
 
-        let target = rootfs.path().join(&relative);
-        match fs::symlink_metadata(&target) {
-            Ok(metadata) => {
-                if metadata.is_dir() && !metadata.file_type().is_symlink() {
-                    return Err(format!(
-                        "数据库把目录 `{}` 记录成了文件，拒绝继续卸载",
-                        target.display()
-                    ));
-                }
-                fs::remove_file(&target)
-                    .map_err(|error| format!("删除文件 `{}` 失败: {error}", target.display()))?;
-                report.removed_files += 1;
+        match transaction.remove_file(&relative) {
+            Ok(true) => report.removed_files += 1,
+            Ok(false) => report.missing += 1,
+            Err(error) => {
+                let rollback = transaction.rollback();
+                return Err(join_rollback(error, rollback));
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                report.missing += 1;
-            }
-            Err(error) => return Err(format!("检查待删文件 `{}` 失败: {error}", target.display())),
         }
-
-        collect_parent_directories(&relative, &mut directories);
+        directories.extend(transaction::parent_directories([relative]));
     }
-
-    report.removed_dirs = remove_empty_directories(rootfs.path(), &directories)?;
 
     if !no_hooks {
-        for hook in &hooks {
-            if hook.phase == POST_REMOVE {
-                hooks::run_hook(POST_REMOVE, package_name, &version, rootfs, &hook.script)?;
+        let post_result = (|| -> Result<(), String> {
+            for hook in &hooks {
+                if hook.phase == POST_REMOVE {
+                    hooks::run_hook(POST_REMOVE, package_name, &version, rootfs, &hook.script)?;
+                }
             }
+            Ok(())
+        })();
+        if let Err(error) = post_result {
+            let rollback = transaction.rollback();
+            return Err(join_rollback(error, rollback));
         }
     }
 
-    // 只有文件系统、空目录和 post_remove 全部成功，才删除数据库记录。
-    db.remove_package_records(package_name)?;
+    // 文件和 post_remove 全部成功后才删除数据库记录；数据库失败则恢复快照。
+    if let Err(error) = db.remove_package_records(package_name) {
+        let rollback = transaction.rollback();
+        return Err(join_rollback(error, rollback));
+    }
+    transaction.commit();
+
+    // 数据库已经提交；空目录清理失败不影响包的卸载结果。
+    report.removed_dirs =
+        transaction::remove_empty_directories(rootfs.path(), &directories).unwrap_or(0);
     Ok(report)
 }
 
-/// 收集文件路径的所有父目录，直到 Rootfs 根。
-fn collect_parent_directories(relative: &Path, directories: &mut BTreeSet<PathBuf>) {
-    let mut current = relative.parent();
-    while let Some(directory) = current {
-        if directory.as_os_str().is_empty() {
-            break;
-        }
-        directories.insert(directory.to_path_buf());
-        current = directory.parent();
+/// 把卸载阶段的错误与回滚结果合并成一条可读信息。
+fn join_rollback(error: String, rollback: Result<(), String>) -> String {
+    match rollback {
+        Ok(()) => format!("{error}; 已回滚文件删除"),
+        Err(rollback_error) => format!("{error}; 回滚失败: {rollback_error}"),
     }
-}
-
-/// 由深到浅删除空目录；非空目录保留，避免误删其他包的内容。
-fn remove_empty_directories(root: &Path, directories: &BTreeSet<PathBuf>) -> Result<usize, String> {
-    let mut ordered = directories.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|directory| std::cmp::Reverse(directory.components().count()));
-
-    let mut removed = 0;
-    for relative in ordered {
-        let directory = root.join(relative);
-        match fs::symlink_metadata(&directory) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(_) => continue,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(format!(
-                    "检查空目录 `{}` 失败: {error}",
-                    directory.display()
-                ))
-            }
-        }
-
-        let mut entries = fs::read_dir(&directory)
-            .map_err(|error| format!("读取目录 `{}` 失败: {error}", directory.display()))?;
-        if entries.next().is_some() {
-            continue;
-        }
-
-        fs::remove_dir(&directory)
-            .map_err(|error| format!("删除空目录 `{}` 失败: {error}", directory.display()))?;
-        removed += 1;
-    }
-    Ok(removed)
 }

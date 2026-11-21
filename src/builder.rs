@@ -24,12 +24,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::ui;
+
 use flate2::read::GzDecoder;
 use liblzma::read::XzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::capability::{Capability, Version};
+use crate::fs_meta::{self, EntryMetadata};
 use crate::hooks::{HookScript, ALL_PHASES};
 use crate::xpkg::{ensure_directory, sanitize_relative, validate_symlink_target, write_file};
 
@@ -204,7 +207,10 @@ pub fn build_package_with_options(
     let package_log = log_dir.join(format!("{}-package.log", script.name));
     let _ = fs::write(&build_log, b"");
     let _ = fs::write(&package_log, b"");
-    println!("==> 构建日志: {}", build_log.display());
+    ui::phase(&ui::pick(
+        format!("构建日志: {}", build_log.display()),
+        format!("Build log: {}", build_log.display()),
+    ));
 
     if options.sandbox {
         run_steps_sandboxed(
@@ -264,7 +270,7 @@ fn run_steps_sandboxed(
 ) -> Result<(), Error> {
     let sandbox = BuildSandbox::create(source_dir, pkgdir, makeflags)?;
     for (index, step) in steps.iter().enumerate() {
-        println!("==> {stage}[{}] (sandbox): {step}", index + 1);
+        ui::step(&format!("{stage}[{}] (sandbox): {step}", index + 1));
         let mut command = Command::new("unshare");
         command
             .args([
@@ -512,7 +518,7 @@ fn run_steps(
     log_path: &Path,
 ) -> Result<(), Error> {
     for (index, step) in steps.iter().enumerate() {
-        println!("==> {stage}[{}]: {step}", index + 1);
+        ui::step(&format!("{stage}[{}]: {step}", index + 1));
         let mut command = Command::new("bash");
         command
             .arg("-e")
@@ -555,7 +561,10 @@ fn prepare_source(spec: &SourceSpec, recipe_dir: &Path, source_root: &Path) -> R
             let downloads = downloads_dir()?;
             for archive in archives {
                 let path = fetch_source(archive, recipe_dir, &downloads)?;
-                println!("==> 解压源码: {}", path.display());
+                ui::step(&ui::pick(
+                    format!("解压源码: {}", path.display()),
+                    format!("Extracting source: {}", path.display()),
+                ));
                 extract_archive(&path, source_root)?;
             }
             Ok(())
@@ -629,11 +638,17 @@ fn fetch_source(
     let filename = source_filename(&archive.url)?;
     let cached = downloads.join(&filename);
     if cached.is_file() && verify_sha256(&cached, &archive.sha256).is_ok() {
-        println!("==> 源码缓存命中: {}", cached.display());
+        ui::step(&ui::pick(
+            format!("源码缓存命中: {}", cached.display()),
+            format!("Source cache hit: {}", cached.display()),
+        ));
         return Ok(cached);
     }
 
-    println!("==> 获取源码: {}", archive.url);
+    ui::step(&ui::pick(
+        format!("获取源码: {}", archive.url),
+        format!("Fetching source: {}", archive.url),
+    ));
 
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -664,7 +679,10 @@ fn fetch_source(
         let _ = fs::remove_file(&partial);
         return Err(error);
     }
-    println!("==> SHA256 校验通过: {}", cached.display());
+    ui::ok(&ui::pick(
+        format!("SHA256 校验通过: {}", cached.display()),
+        format!("SHA256 verified: {}", cached.display()),
+    ));
     fs::rename(&partial, &cached).map_err(|error| {
         let _ = fs::remove_file(&partial);
         format!("保存源码缓存 `{}` 失败: {error}", cached.display())
@@ -789,8 +807,14 @@ fn extract_tar<R: Read>(reader: R, destination: &Path) -> Result<(), Error> {
             ensure_directory(destination, &relative)?;
         } else if entry_type.is_file() {
             let size = entry.size();
-            let mode = entry.header().mode().unwrap_or(0o644);
-            write_file(destination, &relative, &mut entry, size, mode)?;
+            // 源码归档不是安装包：只保留可执行位，剥离 SUID/SGID、属主和 xattrs。
+            let archive_mode = entry.header().mode().unwrap_or(0o644);
+            let metadata = EntryMetadata::from_mode(if archive_mode & 0o111 != 0 {
+                0o755
+            } else {
+                0o644
+            });
+            write_file(destination, &relative, &mut entry, size, &metadata)?;
         } else if entry_type.is_symlink() {
             let target = entry
                 .link_name()
@@ -1056,7 +1080,7 @@ fn write_xpkg_inner(
             )
             .map_err(|error| format!("写入 {} hook 失败: {error}", hook.phase))?;
     }
-    append_directory(&mut builder, Path::new("files"))?;
+    append_directory(&mut builder, Path::new("files"), None)?;
     let mut hardlinks = HashMap::new();
     append_package_tree(
         &mut builder,
@@ -1079,15 +1103,53 @@ fn write_xpkg_inner(
 fn append_directory(
     builder: &mut tar::Builder<zstd::stream::write::Encoder<'static, File>>,
     path: &Path,
+    source: Option<&Path>,
 ) -> Result<(), Error> {
+    if let Some(source) = source {
+        append_pax_xattrs(builder, source)?;
+    }
     let mut header = tar::Header::new_gnu();
     header.set_entry_type(tar::EntryType::Directory);
     header.set_size(0);
-    header.set_mode(0o755);
+    if let Some(source) = source {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::symlink_metadata(source)
+            .map_err(|error| format!("读取目录元数据 `{}` 失败: {error}", source.display()))?;
+        header.set_mode(metadata.permissions().mode() & 0o7777);
+        let (uid, gid) = archived_owner(&metadata);
+        header.set_uid(uid);
+        header.set_gid(gid);
+    } else {
+        header.set_mode(0o755);
+    }
     header.set_cksum();
     builder
         .append_data(&mut header, path, io::empty())
         .map_err(|error| format!("写入目录 `{}` 失败: {error}", path.display()))
+}
+
+/// 把文件的扩展属性写成 PAX 头，确保 `setcap` 产生的 capability 进入包内。
+fn append_pax_xattrs<W: Write>(builder: &mut tar::Builder<W>, source: &Path) -> Result<(), Error> {
+    let xattrs = fs_meta::read_xattrs(source)?;
+    if xattrs.is_empty() {
+        return Ok(());
+    }
+    let headers = xattrs
+        .iter()
+        .map(|(name, value)| {
+            (
+                format!("SCHILY.xattr.{}", name.to_string_lossy()),
+                value.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    builder
+        .append_pax_extensions(
+            headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_slice())),
+        )
+        .map_err(|error| format!("写入 `{}` 的扩展属性失败: {error}", source.display()))
 }
 
 /// 递归把 PKGDIR 内容追加到 `files/` 下，保留符号链接和硬链接。
@@ -1114,7 +1176,7 @@ fn append_package_tree(
             .map_err(|error| format!("读取 `{}` 类型失败: {error}", entry.path().display()))?;
 
         if file_type.is_dir() {
-            append_directory(builder, &archive_path)?;
+            append_directory(builder, &archive_path, Some(&entry.path()))?;
             append_package_tree(builder, pkgdir, archive_root, &child_relative, hardlinks)?;
         } else if file_type.is_file() {
             let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
@@ -1135,21 +1197,19 @@ fn append_package_tree(
                 }
             }
 
-            builder
-                .append_path_with_name(entry.path(), &archive_path)
-                .map_err(|error| {
-                    format!(
-                        "打包文件 `{}` 到 `{}` 失败: {error}",
-                        entry.path().display(),
-                        archive_path.display()
-                    )
-                })?;
+            append_regular_file(builder, &archive_path, &entry.path(), &metadata)?;
         } else if file_type.is_symlink() {
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+                format!(
+                    "读取符号链接元数据 `{}` 失败: {error}",
+                    entry.path().display()
+                )
+            })?;
             let link_target = fs::read_link(entry.path()).map_err(|error| {
                 format!("读取符号链接 `{}` 失败: {error}", entry.path().display())
             })?;
             validate_symlink_target(pkgdir, &child_relative, &link_target)?;
-            append_symlink(builder, &archive_path, &link_target)?;
+            append_symlink(builder, &archive_path, &link_target, &metadata)?;
         } else {
             return Err(format!(
                 "PKGDIR 中包含不支持的文件类型 `{}`",
@@ -1160,16 +1220,69 @@ fn append_package_tree(
     Ok(())
 }
 
+/// 归档中的属主：非 root 构建无法可靠保留属主，统一记为 root。
+fn archived_owner(metadata: &fs::Metadata) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if fs_meta::is_root() {
+            (metadata.uid() as u64, metadata.gid() as u64)
+        } else {
+            (0, 0)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        (0, 0)
+    }
+}
+
+/// 写一个普通文件条目，保留完整权限位并用 `archived_owner` 归一化属主。
+fn append_regular_file(
+    builder: &mut tar::Builder<zstd::stream::write::Encoder<'static, File>>,
+    archive_path: &Path,
+    source: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), Error> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    append_pax_xattrs(builder, source)?;
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_size(metadata.len());
+    header.set_mode(metadata.permissions().mode() & 0o7777);
+    header.set_mtime(metadata.mtime() as u64);
+    let (uid, gid) = archived_owner(metadata);
+    header.set_uid(uid);
+    header.set_gid(gid);
+    let mut file = File::open(source)
+        .map_err(|error| format!("打开待打包文件 `{}` 失败: {error}", source.display()))?;
+    builder
+        .append_data(&mut header, archive_path, &mut file)
+        .map_err(|error| {
+            format!(
+                "打包文件 `{}` 到 `{}` 失败: {error}",
+                source.display(),
+                archive_path.display()
+            )
+        })
+}
+
 /// 写入符号链接条目。
 fn append_symlink(
     builder: &mut tar::Builder<zstd::stream::write::Encoder<'static, File>>,
     path: &Path,
     target: &Path,
+    metadata: &fs::Metadata,
 ) -> Result<(), Error> {
     let mut header = tar::Header::new_gnu();
     header.set_entry_type(tar::EntryType::Symlink);
     header.set_size(0);
     header.set_mode(0o777);
+    let (uid, gid) = archived_owner(metadata);
+    header.set_uid(uid);
+    header.set_gid(gid);
     builder
         .append_link(&mut header, path, target)
         .map_err(|error| {
@@ -1200,6 +1313,9 @@ fn append_hardlink(
     header.set_entry_type(tar::EntryType::Link);
     header.set_size(0);
     header.set_mode(mode);
+    let (uid, gid) = archived_owner(metadata);
+    header.set_uid(uid);
+    header.set_gid(gid);
     builder
         .append_link(&mut header, path, target)
         .map_err(|error| {
@@ -1209,4 +1325,30 @@ fn append_hardlink(
                 target.display()
             )
         })
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn pax_extensions_carry_xattrs_into_the_archive() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("with-cap");
+        fs::write(&source, b"payload").unwrap();
+        xattr::set(&source, "user.xrpkg.builder", b"packed").unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        append_pax_xattrs(&mut builder, &source).unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(7);
+        header.set_mode(0o755);
+        builder
+            .append_data(&mut header, "files/usr/bin/with-cap", &b"payload"[..])
+            .unwrap();
+        let bytes = builder.into_inner().unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("SCHILY.xattr.user.xrpkg.builder"), "{text}");
+        assert!(text.contains("packed"), "{text}");
+    }
 }

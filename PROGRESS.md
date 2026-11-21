@@ -12,11 +12,28 @@
 - **目标系统**：XROS beta1.0（运行在 NVMe 硬盘 `/dev/nvme0n1` 上，已完美启动并拥有 root 权限）。
 - **核心工具**：`xrpkg` 已在 XROS 内可用，但原生的系统包还很少，主要依赖兼容轨道（缝合 Arch 包）。
 
+## CLI 输出标准化与多语言（阶段 29.5）
+- 新增 `src/ui.rs`：集中管理语言、字符集、颜色、状态前缀、表格和帮助。
+- 语言依据 `LC_ALL > LC_MESSAGES > LANG`；`zh*` + UTF-8 输出中文，其余输出英文；`zh*` 但终端不是 UTF-8 时回退 ASCII 英文，避免方块。
+- `XRPKG_LANG=zh_CN.UTF-8|en_US.UTF-8` 可显式覆盖语言，`XRPKG_ASCII=1` 强制 ASCII 英文，`NO_COLOR=1` 禁用颜色。
+- 统一前缀：`::` 阶段、`  ->` 步骤、`  [ok]` 成功、`warning:`、`error:`；不使用 Unicode 框线或 Emoji。
+- 新增 `--help`/`-h`、`--version`/`-V`、`list` 命令；无参数时显示帮助，不再默认安装 demo 包。
+- 安装计划、搜索、已安装包改用自动对齐表格；状态变更后不再倾倒整个数据库，只打印事务摘要，完整列表用 `xrpkg list`。
+- 端到端测试覆盖中文、英文、非 UTF-8 回退、显式覆盖、ASCII 覆盖、空参数帮助和版本输出；当前 32 个测试目标、174 个测试通过。
+
+## 阶段 30：事务与元数据加固（已完成）
+- **元数据保真**：新增 `src/fs_meta.rs`，TAR 解包与文件发布完整保留 SUID/SGID、属主和扩展属性；同时解析 GNU tar `SCHILY.xattr.*` 与 libarchive `LIBARCHIVE.xattr.*`（Base64），`security.capability` 不再被丢弃。
+- **原生打包**：`builder` 写包时保留权限位和 xattrs；非 root 构建统一把归档属主归一化为 root，避免把开发用户的 UID 带进目标系统。
+- **原子发布**：新增 `src/transaction.rs`。每个文件先写同目录临时文件、应用完整元数据并 `fsync`，再 `rename(2)` 覆盖目标；旧文件用硬链接/改名快照。
+- **崩溃恢复**：事务日志写入 `<rootfs>/.xrpkg-txn/<id>/journal`。下次事务开始前按日志和数据库状态判定提交或回滚，覆盖数据库提交前后的断电窗口。
+- **卸载/升级回滚**：卸载先把文件移入快照，`post_remove` 或数据库提交失败时原样恢复；外部 `.deb`/`.rpm`/`.pkg.tar.zst` 升级复用同一事务，失败恢复旧文件和旧版本记录。卸载前还会检查目标 Rootfs 是否至少包含一个该包的独占文件，避免 `--root` 指错时只删数据库记录。
+- **本地安装**：`xrpkg install ./foo.xpkg` 已接入统一求解/ABI/事务提交路径。
+- **world 编排**：`build-world` 已完整接入 `main.rs`，clippy 与 fmt 保持全绿。
+- **XROS 实机**：通过挂载 `/dev/nvme0n1p3` 安装 `noto-fonts-cjk 20240730-1`（14 个 TTC，约 299 MiB），刷新 fontconfig 缓存；新构建的 `xrpkg` 部署到 `/usr/bin/xrpkg`，旧二进制备份为 `/usr/bin/xrpkg.old`。
+- **测试基线**：32 个测试目标、174 个测试通过，clippy `-D warnings` 与 `cargo fmt --check` 全绿；capability 用例在 root 下单独验证通过。
+
 ## 当前任务 (In Progress)
-**阶段 29：跨生态仓库同步器（xrpkg sync）**
-- 目标：开发 `xrpkg sync` 命令，让它能直接解析 Pacman 的源（Arch Linux），拉取包并转换成 XROS 可用的本地仓库。
-- 核心要求：
-  1. 解析 `core.db` (tar.gz格式的元数据包)。
-  2. 根据 `config/deps_map.toml` 进行依赖过滤。
-  3. 自动下载 `.pkg.tar.zst`，通过 ABI 守门员校验，然后收入本地 `repo/` 目录并重新签名。
-- 优先只实现 Arch (pacman)，暂不碰 apt 和 dnf。
+**阶段 31：生产可用性收尾**
+- RPM 包头的 `%caps` 文本尚未转换为 `security.capability` 二进制；当前优先保证 Arch `.pkg.tar.zst` 与原生 `.xpkg` 的 capability 保真。
+- `Rootfs::prepare` 仍拒绝 `/`，真实系统写入需从宿主挂载目标分区后使用 `--root <挂载点>`；是否开放受控的 `--root /` 需要单独的安全设计。
+- 下一步补充真实断电注入、只读目标盘、并发 xrpkg 进程锁和安装后 `ldconfig`/fontconfig 钩子的回归测试。

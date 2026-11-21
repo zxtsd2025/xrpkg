@@ -236,3 +236,51 @@ XRPKG_TEST_VALUE = "from-recipe-env"
         "from-recipe-env"
     );
 }
+
+#[test]
+fn packaging_preserves_suid_bits() {
+    let temp = TempDir::new().unwrap();
+    let source = temp.path().join("src");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("tool"), b"#!/bin/sh\necho tool\n").unwrap();
+    let recipe = temp.path().join("suid.toml");
+    fs::write(
+        &recipe,
+        r#"
+name = "suid-tool"
+version = "1.0"
+source = "src"
+requires = []
+package = [
+  "install -Dm4755 tool \"$PKGDIR/usr/bin/suid-tool\"",
+]
+"#,
+    )
+    .unwrap();
+    let output_dir = temp.path().join("out");
+    let archive = build_package(&recipe, &output_dir).unwrap();
+
+    let file = fs::File::open(&archive).unwrap();
+    let decoder = zstd::stream::read::Decoder::new(file).unwrap();
+    let mut tar = tar::Archive::new(decoder);
+    let entry = tar
+        .entries()
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .find(|entry| entry.path().unwrap() == std::path::Path::new("files/usr/bin/suid-tool"))
+        .unwrap();
+    assert_eq!(entry.header().uid().unwrap(), 0);
+    assert_eq!(entry.header().gid().unwrap(), 0);
+
+    let rootfs = Rootfs::prepare(temp.path().join("rootfs")).unwrap();
+    let expected = SelectedPackage {
+        name: "suid-tool".to_string(),
+        version: Version::parse("1.0").unwrap(),
+    };
+    install_package(&archive, &expected, &rootfs).unwrap();
+    let installed = rootfs.path().join("usr/bin/suid-tool");
+    assert_eq!(
+        fs::metadata(&installed).unwrap().permissions().mode() & 0o7777,
+        0o4755
+    );
+}

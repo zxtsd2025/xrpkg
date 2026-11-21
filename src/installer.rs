@@ -4,7 +4,6 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,6 +14,8 @@ use crate::hooks::{
 };
 use crate::solver::SelectedPackage;
 use crate::state::{LocalDb, PackageInstall};
+use crate::transaction::{self, Transaction};
+use crate::ui;
 use crate::xpkg::{self, Rootfs};
 
 /// 一个正在升级的包。
@@ -64,12 +65,17 @@ pub fn install_changes(
             abi_guard.check_file(&package.name, file, &staged_file)?;
         }
 
-        println!(
-            "解包并校验 {} {} -> 暂存区 ({} 个文件)",
-            package.name,
-            package.version,
-            files.len()
-        );
+        let file_count = ui::count(files.len(), "file", "files", "个文件");
+        ui::step(&ui::pick(
+            format!(
+                "解包并校验 {} {} -> 暂存区 ({file_count})",
+                package.name, package.version
+            ),
+            format!(
+                "Unpacking and checking {} {} -> staging ({file_count})",
+                package.name, package.version
+            ),
+        ));
         installs.push(PackageInstall {
             package: package.clone(),
             version_raw: package.version.to_string(),
@@ -108,7 +114,10 @@ pub fn install_changes(
     }
 
     let rootfs = Rootfs::prepare(rootfs_path)?;
-    let backup = Backup::create(&rootfs, &upgrades)?;
+    let mut transaction = Transaction::begin(&rootfs, Some(db))?;
+    for install in &installs {
+        transaction.record_install(&install.package.name, &install.version_raw, &install.origin)?;
+    }
 
     // 旧版本是 native 时执行新包的 pre_upgrade；外部包先执行旧包 pre_remove。
     if !no_hooks {
@@ -145,7 +154,7 @@ pub fn install_changes(
             Ok(())
         })();
         if let Err(error) = pre_result {
-            let rollback = backup.restore(&rootfs);
+            let rollback = transaction.rollback();
             return Err(join_rollback(error, rollback));
         }
     }
@@ -154,23 +163,33 @@ pub fn install_changes(
         .iter()
         .flat_map(|install| install.files.iter().cloned())
         .collect::<Vec<_>>();
-    if let Err(error) = xpkg::publish_files(&staging, &rootfs, &all_files) {
-        let rollback = rollback_install(db, &installs, &rootfs, &backup);
+    if let Err(error) = xpkg::publish_files_txn(&mut transaction, &staging, &all_files) {
+        let rollback = transaction.rollback();
         return Err(join_rollback(error, rollback));
     }
-    println!(
-        "ABI 校验通过（GLIBC 基线 {MAX_GLIBC_VERSION}），发布到 {}",
-        rootfs.path().display()
-    );
+    ui::ok(&ui::pick(
+        format!(
+            "ABI 校验通过（GLIBC 基线 {MAX_GLIBC_VERSION}），发布到 {}",
+            rootfs.path().display()
+        ),
+        format!(
+            "ABI check passed (GLIBC baseline {MAX_GLIBC_VERSION}); published to {}",
+            rootfs.path().display()
+        ),
+    ));
 
     let new_files = installs
         .iter()
         .flat_map(|install| install.files.iter().cloned())
         .collect::<BTreeSet<_>>();
-    if let Err(error) = remove_obsolete_files(db, &rootfs, &installs, &upgrades, &new_files) {
-        let rollback = rollback_install(db, &installs, &rootfs, &backup);
-        return Err(join_rollback(error, rollback));
-    }
+    let directories =
+        match remove_obsolete_files(db, &mut transaction, &installs, &upgrades, &new_files) {
+            Ok(directories) => directories,
+            Err(error) => {
+                let rollback = transaction.rollback();
+                return Err(join_rollback(error, rollback));
+            }
+        };
 
     if !no_hooks {
         let post_result = (|| -> Result<(), String> {
@@ -194,16 +213,22 @@ pub fn install_changes(
             Ok(())
         })();
         if let Err(error) = post_result {
-            let rollback = rollback_install(db, &installs, &rootfs, &backup);
+            let rollback = transaction.rollback();
             return Err(join_rollback(error, rollback));
         }
     }
 
     if let Err(error) = db.commit(&installs) {
-        let rollback = rollback_install(db, &installs, &rootfs, &backup);
+        let rollback = transaction.rollback();
         return Err(join_rollback(error, rollback));
     }
-    println!("提交完成: 已写入 {} 个包", installs.len());
+    transaction.commit();
+    let _ = transaction::remove_empty_directories(rootfs.path(), &directories);
+    let package_count = ui::count(installs.len(), "package", "packages", "个包");
+    ui::ok(&ui::pick(
+        format!("提交完成: 已写入 {package_count}"),
+        format!("Transaction committed: {package_count} installed"),
+    ));
     Ok(())
 }
 
@@ -248,14 +273,16 @@ fn run_old_phase(
 }
 
 /// 清理旧版本有、新版本没有，且未被其他包/本次其他新包引用的文件。
+///
+/// 文件先移入事务快照而不是直接删除；返回需要提交后清理的父目录。
 fn remove_obsolete_files(
     db: &LocalDb,
-    rootfs: &Rootfs,
+    transaction: &mut Transaction,
     installs: &[PackageInstall],
     upgrades: &[Upgrade],
     new_files: &BTreeSet<String>,
-) -> Result<(), String> {
-    let mut directories = BTreeSet::new();
+) -> Result<BTreeSet<PathBuf>, String> {
+    let mut removed = Vec::new();
     for upgrade in upgrades {
         for file in &upgrade.old_files {
             if new_files.contains(file) {
@@ -267,63 +294,11 @@ fn remove_obsolete_files(
             }
             let relative = xpkg::sanitize_relative(Path::new(file))
                 .map_err(|error| format!("旧文件路径 `{file}` 非法: {error}"))?;
-            let target = rootfs.path().join(&relative);
-            match fs::symlink_metadata(&target) {
-                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-                    return Err(format!("旧文件 `{}` 是目录", target.display()))
-                }
-                Ok(_) => fs::remove_file(&target).map_err(|error| {
-                    format!("删除废弃文件 `{}` 失败: {error}", target.display())
-                })?,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!("检查废弃文件 `{}` 失败: {error}", target.display()))
-                }
-            }
-            collect_parent_directories(&relative, &mut directories);
+            transaction.remove_file(&relative)?;
+            removed.push(relative);
         }
     }
-    remove_empty_directories(rootfs.path(), &directories)
-}
-
-/// 回滚已发布文件，再恢复旧版本备份。
-fn rollback_install(
-    db: &LocalDb,
-    installs: &[PackageInstall],
-    rootfs: &Rootfs,
-    backup: &Backup,
-) -> Result<(), String> {
-    rollback_published(db, installs, rootfs)?;
-    backup.restore(rootfs)
-}
-
-fn rollback_published(
-    db: &LocalDb,
-    installs: &[PackageInstall],
-    rootfs: &Rootfs,
-) -> Result<(), String> {
-    let mut directories = BTreeSet::new();
-    for install in installs {
-        for file in &install.files {
-            if db.file_claimed_by_other(&install.package.name, file)? {
-                continue;
-            }
-            let relative = xpkg::sanitize_relative(Path::new(file))
-                .map_err(|error| format!("回滚路径 `{file}` 非法: {error}"))?;
-            let target = rootfs.path().join(&relative);
-            match fs::symlink_metadata(&target) {
-                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-                    return Err(format!("回滚目标 `{}` 是目录", target.display()))
-                }
-                Ok(_) => fs::remove_file(&target)
-                    .map_err(|error| format!("回滚删除 `{}` 失败: {error}", target.display()))?,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("回滚检查 `{}` 失败: {error}", target.display())),
-            }
-            collect_parent_directories(&relative, &mut directories);
-        }
-    }
-    remove_empty_directories(rootfs.path(), &directories)
+    Ok(transaction::parent_directories(removed))
 }
 
 fn join_rollback(error: String, rollback: Result<(), String>) -> String {
@@ -331,156 +306,6 @@ fn join_rollback(error: String, rollback: Result<(), String>) -> String {
         Ok(()) => format!("{error}; 已回滚并恢复旧版本"),
         Err(rollback_error) => format!("{error}; 回滚/恢复失败: {rollback_error}"),
     }
-}
-
-/// 旧版本文件备份，用于升级失败时恢复。
-struct Backup {
-    root: PathBuf,
-    entries: Vec<(PathBuf, PathBuf)>,
-}
-
-impl Backup {
-    fn create(rootfs: &Rootfs, upgrades: &[Upgrade]) -> Result<Self, String> {
-        if upgrades.is_empty() {
-            return Ok(Self {
-                root: PathBuf::new(),
-                entries: Vec::new(),
-            });
-        }
-        let base = PathBuf::from("/var/tmp/xrpkg-upgrade");
-        fs::create_dir_all(&base).map_err(|error| format!("创建升级备份目录失败: {error}"))?;
-        let root = base.join(format!("backup-{}-{}", std::process::id(), nonce()));
-        fs::create_dir(&root)
-            .map_err(|error| format!("创建升级备份 `{}` 失败: {error}", root.display()))?;
-
-        let mut entries = Vec::new();
-        for upgrade in upgrades {
-            for file in &upgrade.old_files {
-                let relative = xpkg::sanitize_relative(Path::new(file))
-                    .map_err(|error| format!("备份路径 `{file}` 非法: {error}"))?;
-                let source = rootfs.path().join(&relative);
-                let metadata = match fs::symlink_metadata(&source) {
-                    Ok(metadata) => metadata,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                    Err(error) => {
-                        return Err(format!("备份检查 `{}` 失败: {error}", source.display()))
-                    }
-                };
-                let destination = root.join(&relative);
-                if let Some(parent) = destination.parent() {
-                    fs::create_dir_all(parent)
-                        .map_err(|error| format!("创建备份目录失败: {error}"))?;
-                }
-                if metadata.file_type().is_symlink() {
-                    let target = fs::read_link(&source).map_err(|error| {
-                        format!("读取备份符号链接 `{}` 失败: {error}", source.display())
-                    })?;
-                    create_symlink(&target, &destination)?;
-                } else if metadata.is_file() {
-                    fs::copy(&source, &destination).map_err(|error| {
-                        format!("备份文件 `{}` 失败: {error}", source.display())
-                    })?;
-                } else {
-                    return Err(format!("备份目标 `{}` 不是文件/符号链接", source.display()));
-                }
-                entries.push((relative, destination));
-            }
-        }
-        Ok(Self { root, entries })
-    }
-
-    fn restore(&self, rootfs: &Rootfs) -> Result<(), String> {
-        for (relative, backup) in &self.entries {
-            let target = rootfs.path().join(relative);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|error| format!("恢复创建目录失败: {error}"))?;
-            }
-            match fs::symlink_metadata(&target) {
-                Ok(_) => {
-                    let _ = fs::remove_file(&target);
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("恢复检查 `{}` 失败: {error}", target.display())),
-            }
-            let metadata = fs::symlink_metadata(backup)
-                .map_err(|error| format!("读取备份 `{}` 失败: {error}", backup.display()))?;
-            if metadata.file_type().is_symlink() {
-                let link =
-                    fs::read_link(backup).map_err(|error| format!("读取备份链接失败: {error}"))?;
-                create_symlink(&link, &target)?;
-            } else {
-                fs::copy(backup, &target)
-                    .map_err(|error| format!("恢复文件 `{}` 失败: {error}", target.display()))?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Drop for Backup {
-    fn drop(&mut self) {
-        if !self.root.as_os_str().is_empty() {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-}
-
-fn create_symlink(target: &Path, destination: &Path) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(target, destination)
-            .map_err(|error| format!("创建符号链接 `{}` 失败: {error}", destination.display()))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (target, destination);
-        Err("当前平台不支持符号链接".to_string())
-    }
-}
-
-fn nonce() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0)
-}
-
-fn collect_parent_directories(relative: &Path, directories: &mut BTreeSet<PathBuf>) {
-    let mut current = relative.parent();
-    while let Some(directory) = current {
-        if directory.as_os_str().is_empty() {
-            break;
-        }
-        directories.insert(directory.to_path_buf());
-        current = directory.parent();
-    }
-}
-
-fn remove_empty_directories(root: &Path, directories: &BTreeSet<PathBuf>) -> Result<(), String> {
-    let mut ordered = directories.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|directory| std::cmp::Reverse(directory.components().count()));
-    for relative in ordered {
-        let directory = root.join(relative);
-        match fs::symlink_metadata(&directory) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(_) => continue,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(format!(
-                    "检查空目录 `{}` 失败: {error}",
-                    directory.display()
-                ))
-            }
-        }
-        let mut entries = fs::read_dir(&directory)
-            .map_err(|error| format!("读取目录 `{}` 失败: {error}", directory.display()))?;
-        if entries.next().is_some() {
-            continue;
-        }
-        fs::remove_dir(&directory)
-            .map_err(|error| format!("删除空目录 `{}` 失败: {error}", directory.display()))?;
-    }
-    Ok(())
 }
 
 /// 临时暂存目录；离开作用域时自动清理。

@@ -20,6 +20,7 @@ use crate::resolvo_solver::incremental_plan;
 use crate::sign;
 use crate::solver::{Package, SelectedPackage};
 use crate::state::LocalDb;
+use crate::ui;
 use crate::xpkg::read_metadata;
 
 /// 本模块使用的错误类型；当前统一用可读字符串。
@@ -233,7 +234,10 @@ pub fn update(config_path: &Path, cache_dir: &Path) -> Result<Vec<CachedRepo>, E
     for repo in repos {
         let url = repo_index_url(&repo.url)?;
         let signature_url = format!("{url}.sig");
-        println!("==> 更新仓库 {}: {}", repo.name, url);
+        ui::phase(&ui::pick(
+            format!("更新仓库 {}: {}", repo.name, url),
+            format!("Updating repository {}: {}", repo.name, url),
+        ));
         let bytes = fetch_bytes(&url)?;
         let signature = fetch_bytes(&signature_url)
             .map_err(|error| format!("仓库索引签名文件缺失或不可读: {error}"))?;
@@ -268,7 +272,10 @@ pub fn update(config_path: &Path, cache_dir: &Path) -> Result<Vec<CachedRepo>, E
                 signature_target.display()
             )
         })?;
-        println!("    签名验证通过，包数量: {}", index.packages.len());
+        ui::note(&ui::pick(
+            format!("签名验证通过，包数量: {}", index.packages.len()),
+            format!("Signature verified; {} packages", index.packages.len()),
+        ));
         cached.push(CachedRepo {
             name: repo.name,
             url: repo.url,
@@ -517,7 +524,13 @@ pub fn download_packages(
             let url = join_repo_url(&source.repo_url, &source.filename)?;
             fetch_package(&url, &target, &source.sha256, keyring, &package.name)?;
         } else {
-            println!("==> 包缓存命中且签名有效: {}", target.display());
+            ui::step(&ui::pick(
+                format!("包缓存命中且签名有效: {}", target.display()),
+                format!(
+                    "Package cache hit and signature valid: {}",
+                    target.display()
+                ),
+            ));
         }
         archives.insert((package.name.clone(), package.version.clone()), target);
     }
@@ -622,12 +635,20 @@ pub fn clean_cache(
                 report.signatures += 1;
                 report.bytes += signature_size;
             }
-            println!(
-                "==> 清理缓存包: {} {} ({})",
-                metadata.name,
-                metadata.version,
-                path.display()
-            );
+            ui::step(&ui::pick(
+                format!(
+                    "清理缓存包: {} {} ({})",
+                    metadata.name,
+                    metadata.version,
+                    path.display()
+                ),
+                format!(
+                    "Removing cached package: {} {} ({})",
+                    metadata.name,
+                    metadata.version,
+                    path.display()
+                ),
+            ));
         }
     }
     Ok(report)
@@ -731,7 +752,10 @@ pub fn install_from_repositories_with_mirrors(
     )?;
     let changes = incremental_plan(&resolution, &installed);
     if changes.is_empty() {
-        println!("{requested} 已经安装，无需操作");
+        ui::note(&ui::pick(
+            format!("{requested} 已经安装，无需操作"),
+            format!("{requested} is already installed"),
+        ));
         return Ok(RepositoryInstall::Native);
     }
     if !allow_downgrade {
@@ -747,10 +771,12 @@ pub fn install_from_repositories_with_mirrors(
         }
     }
 
-    println!("安装计划:");
-    for package in &changes {
-        println!("{} {}", package.name, package.version);
-    }
+    ui::phase(ui::t("Install plan", "安装计划"));
+    let rows = changes
+        .iter()
+        .map(|package| [package.name.clone(), package.version.to_string()])
+        .collect::<Vec<_>>();
+    ui::table2([ui::t("Package", "包"), ui::t("Version", "版本")], &rows);
     let archives = download_packages(&pool, &changes, cache_dir, &keyring)?;
     installer::install_changes(
         db,
@@ -795,22 +821,40 @@ fn download_arch_package(
     })?;
     let target = target_dir.join(&package.filename);
     if target.is_file() && verify_sha256(&target, &package.sha256).is_ok() {
-        println!("==> Arch 包缓存命中: {}", target.display());
+        ui::step(&ui::pick(
+            format!("Arch 包缓存命中: {}", target.display()),
+            format!("Arch package cache hit: {}", target.display()),
+        ));
         return Ok(target);
     }
 
     let mut failures = Vec::new();
     for mirror in mirrors {
         let url = download::join_location(&mirror.url, &package.filename)?;
-        println!(
-            "==> 从镜像 {} 下载 Arch 包 {} {}: {}",
-            mirror.name, package.name, package.version, url
+        ui::phase(&ui::pick(
+            format!(
+                "从镜像 {} 下载 Arch 包 {} {}: {}",
+                mirror.name, package.name, package.version, url
+            ),
+            format!(
+                "Downloading Arch package {} {} from mirror {}: {}",
+                package.name, package.version, mirror.name, url
+            ),
+        ));
+        let bar = download::single_bar(
+            0,
+            &ui::pick(
+                format!("下载 {}", package.name),
+                format!("Downloading {}", package.name),
+            ),
         );
-        let bar = download::single_bar(0, &format!("下载 {}", package.name));
         let partial = target.with_extension(format!("part-{}", unique_nonce()));
         let downloaded = download::to_file(&url, &partial, &bar).inspect_err(|_| {
             let _ = fs::remove_file(&partial);
-            bar.abandon_with_message(format!("失败 {}", package.name));
+            bar.abandon_with_message(ui::pick(
+                format!("失败 {}", package.name),
+                format!("Failed {}", package.name),
+            ));
         });
         let downloaded = match downloaded {
             Ok(written) => written,
@@ -1031,17 +1075,26 @@ fn fetch_package(
 ) -> Result<(), Error> {
     let partial = target.with_extension(format!("part-{}", unique_nonce()));
     if !download::progress_enabled() {
-        println!("==> 下载包 {label}: {url}");
+        ui::phase(&ui::pick(
+            format!("下载包 {label}: {url}"),
+            format!("Downloading package {label}: {url}"),
+        ));
     }
-    let bar = download::single_bar(0, &format!("下载 {label}"));
+    let bar = download::single_bar(
+        0,
+        &ui::pick(format!("下载 {label}"), format!("Downloading {label}")),
+    );
     if let Err(error) = download::to_file(url, &partial, &bar) {
         let _ = fs::remove_file(&partial);
-        bar.abandon_with_message(format!("失败 {label}"));
+        bar.abandon_with_message(ui::pick(format!("失败 {label}"), format!("Failed {label}")));
         return Err(error);
     }
     if let Err(error) = verify_sha256(&partial, expected) {
         let _ = fs::remove_file(&partial);
-        bar.abandon_with_message(format!("校验失败 {label}"));
+        bar.abandon_with_message(ui::pick(
+            format!("校验失败 {label}"),
+            format!("Checksum failed {label}"),
+        ));
         return Err(error);
     }
 

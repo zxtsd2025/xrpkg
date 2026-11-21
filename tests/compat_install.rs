@@ -305,3 +305,79 @@ fn deb_upgrade_runs_old_prerm_and_new_preinst_and_removes_obsolete_file() {
     assert_eq!(installed[0].version_raw, "2.0-1");
     assert_eq!(installed[0].origin, "deb");
 }
+
+#[test]
+fn failed_external_upgrade_restores_old_files_and_database() {
+    let temp = TempDir::new().unwrap();
+    let rootfs = temp.path().join("rootfs");
+    let db_path = temp.path().join("local.db");
+    let bin = Path::new(env!("CARGO_BIN_EXE_xrpkg"));
+    let rootfs_arg = rootfs.to_string_lossy().into_owned();
+    let db_arg = db_path.to_string_lossy().into_owned();
+
+    let old = write_deb_custom(
+        &temp.path().join("deb-rollback-1.0.deb"),
+        "deb-rollback",
+        "1.0-1",
+        "./usr/share/deb-rollback/old.txt",
+        b"old\n",
+        &[],
+    );
+    let output = run(
+        bin,
+        &[
+            "install",
+            &old.to_string_lossy(),
+            "--root",
+            &rootfs_arg,
+            "--db",
+            &db_arg,
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let new = write_deb_custom(
+        &temp.path().join("deb-rollback-2.0.deb"),
+        "deb-rollback",
+        "2.0-1",
+        "./usr/share/deb-rollback/new.txt",
+        b"new\n",
+        &[("./postinst", b"#!/bin/sh\nexit 1\n")],
+    );
+    let output = run(
+        bin,
+        &[
+            "install",
+            &new.to_string_lossy(),
+            "--root",
+            &rootfs_arg,
+            "--db",
+            &db_arg,
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("回滚"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        fs::read_to_string(rootfs.join("usr/share/deb-rollback/old.txt")).unwrap(),
+        "old\n"
+    );
+    assert!(!rootfs.join("usr/share/deb-rollback/new.txt").exists());
+    let db = LocalDb::open(&db_path).unwrap();
+    let installed = db.list_installed().unwrap();
+    assert_eq!(installed.len(), 1);
+    assert_eq!(installed[0].version_raw, "1.0-1");
+    assert_eq!(
+        db.list_files("deb-rollback").unwrap(),
+        ["usr/share/deb-rollback/old.txt"]
+    );
+}

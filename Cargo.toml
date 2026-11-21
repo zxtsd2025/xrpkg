@@ -20,6 +20,9 @@ rpm = { version = "0.30.2", default-features = false, features = ["payload", "gz
 ureq = "2.12"
 sha2 = "0.10"
 indicatif = "0.17"
+xattr = "1"
+base64 = "0.22"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -16,6 +16,7 @@ use crate::capability::Version;
 use crate::installer;
 use crate::solver::SelectedPackage;
 use crate::state::LocalDb;
+use crate::ui;
 use crate::xpkg;
 
 /// `recipes/system.toml` 的结构；数组顺序即构建顺序。
@@ -75,7 +76,7 @@ impl WorldLog {
 
     /// 写一行日志；终端输出与文件内容保持一致。
     fn line(&mut self, message: &str) {
-        println!("{message}");
+        ui::raw(message);
         let _ = writeln!(self.file, "{message}");
         let _ = self.file.flush();
     }
@@ -90,25 +91,45 @@ pub fn build_world(
     options: &WorldOptions,
 ) -> Result<WorldReport, String> {
     let mut log = WorldLog::create(&options.log_path)?;
-    log.line("==> build-world 开始");
-    log.line(&format!("==> 系统清单: {}", config_path.display()));
+    log.line(&ui::pick("==> build-world 开始", "==> build-world started"));
+    log.line(&ui::pick(
+        format!("==> 系统清单: {}", config_path.display()),
+        format!("==> System manifest: {}", config_path.display()),
+    ));
 
     let recipes = match load_recipes(config_path) {
         Ok(recipes) => recipes,
         Err(error) => {
-            log.line(&format!("==> 读取系统清单失败: {error}"));
+            log.line(&ui::pick(
+                format!("==> 读取系统清单失败: {error}"),
+                format!("==> Failed to read system manifest: {error}"),
+            ));
             return Err(error);
         }
     };
-    log.line(&format!(
-        "==> 共 {} 个包；输出仓库 {}；目标 Rootfs {}",
-        recipes.len(),
-        repo_dir.display(),
-        rootfs_path.display()
+    log.line(&ui::pick(
+        format!(
+            "==> 共 {} 个包；输出仓库 {}；目标 Rootfs {}",
+            recipes.len(),
+            repo_dir.display(),
+            rootfs_path.display()
+        ),
+        format!(
+            "==> {} package(s); repository {}; target root {}",
+            recipes.len(),
+            repo_dir.display(),
+            rootfs_path.display()
+        ),
     ));
-    log.line(&format!(
-        "==> 数据库: {}；串行编排，--jobs 仅传给每个构建的 MAKEFLAGS",
-        db_path.display()
+    log.line(&ui::pick(
+        format!(
+            "==> 数据库: {}；串行编排，--jobs 仅传给每个构建的 MAKEFLAGS",
+            db_path.display()
+        ),
+        format!(
+            "==> Database: {}; serial orchestration, --jobs is passed to each build's MAKEFLAGS",
+            db_path.display()
+        ),
     ));
 
     let mut db = LocalDb::open(db_path)?;
@@ -122,7 +143,10 @@ pub fn build_world(
                     "build-world 读取配方 `{}` 失败，后续包未处理: {error}",
                     recipe_path.display()
                 );
-                log.line(&format!("==> 失败: {message}"));
+                log.line(&ui::pick(
+                    format!("==> 失败: {message}"),
+                    format!("==> Failed: {message}"),
+                ));
                 return Err(message);
             }
         };
@@ -131,13 +155,19 @@ pub fn build_world(
             .map_err(|error| format!("配方 `{label}` 的版本非法: {error}"))?;
         let archive_path = repo_dir.join(format!("{}-{}.xpkg", identity.name, identity.version));
 
-        log.line(&format!("==> [{}/{}] {label}", index + 1, recipes.len()));
+        log.line(&ui::pick(
+            format!("==> [{}/{}] {label}", index + 1, recipes.len()),
+            format!("==> [{}/{}] {label}", index + 1, recipes.len()),
+        ));
 
         let archive = if archive_path.is_file() {
             report.skipped += 1;
-            log.line(&format!(
-                "    跳过构建: `{}` 已存在",
-                archive_path.display()
+            log.line(&ui::pick(
+                format!("    跳过构建: `{}` 已存在", archive_path.display()),
+                format!(
+                    "    Build skipped: `{}` already exists",
+                    archive_path.display()
+                ),
             ));
             archive_path
         } else {
@@ -152,14 +182,23 @@ pub fn build_world(
             match built {
                 Ok(path) => {
                     report.built += 1;
-                    log.line(&format!("    构建完成: `{}`", path.display()));
+                    log.line(&ui::pick(
+                        format!("    构建完成: `{}`", path.display()),
+                        format!("    Build complete: `{}`", path.display()),
+                    ));
                     path
                 }
                 Err(error) => {
                     let message =
                         format!("build-world 在 `{label}` 构建失败，后续包未处理: {error}");
-                    log.line(&format!("    构建失败: {error}"));
-                    log.line(&format!("==> 失败: {message}"));
+                    log.line(&ui::pick(
+                        format!("    构建失败: {error}"),
+                        format!("    Build failed: {error}"),
+                    ));
+                    log.line(&ui::pick(
+                        format!("==> 失败: {message}"),
+                        format!("==> Failed: {message}"),
+                    ));
                     return Err(message);
                 }
             }
@@ -172,7 +211,10 @@ pub fn build_world(
                     "build-world 在 `{label}` 读取归档 `{}` 失败，后续包未处理: {error}",
                     archive.display()
                 );
-                log.line(&format!("==> 失败: {message}"));
+                log.line(&ui::pick(
+                    format!("==> 失败: {message}"),
+                    format!("==> Failed: {message}"),
+                ));
                 return Err(message);
             }
         };
@@ -183,7 +225,10 @@ pub fn build_world(
                 metadata.name,
                 metadata.version
             );
-            log.line(&format!("==> 失败: {message}"));
+            log.line(&ui::pick(
+                format!("==> 失败: {message}"),
+                format!("==> Failed: {message}"),
+            ));
             return Err(message);
         }
 
@@ -193,7 +238,10 @@ pub fn build_world(
             .any(|package| package.name == identity.name && package.version == version)
         {
             report.already_installed += 1;
-            log.line("    已安装相同版本，跳过安装");
+            log.line(&ui::pick(
+                "    已安装相同版本，跳过安装",
+                "    Same version already installed; install skipped",
+            ));
             continue;
         }
 
@@ -213,20 +261,32 @@ pub fn build_world(
         ) {
             Ok(()) => {
                 report.installed += 1;
-                log.line("    安装完成");
+                log.line(&ui::pick("    安装完成", "    Install complete"));
             }
             Err(error) => {
                 let message = format!("build-world 在 `{label}` 安装失败，后续包未处理: {error}");
-                log.line(&format!("    安装失败: {error}"));
-                log.line(&format!("==> 失败: {message}"));
+                log.line(&ui::pick(
+                    format!("    安装失败: {error}"),
+                    format!("    Install failed: {error}"),
+                ));
+                log.line(&ui::pick(
+                    format!("==> 失败: {message}"),
+                    format!("==> Failed: {message}"),
+                ));
                 return Err(message);
             }
         }
     }
 
-    log.line(&format!(
-        "==> build-world 完成: 构建 {}，跳过构建 {}，安装 {}，已安装 {}",
-        report.built, report.skipped, report.installed, report.already_installed
+    log.line(&ui::pick(
+        format!(
+            "==> build-world 完成: 构建 {}，跳过构建 {}，安装 {}，已安装 {}",
+            report.built, report.skipped, report.installed, report.already_installed
+        ),
+        format!(
+            "==> build-world complete: {} built, {} skipped, {} installed, {} already installed",
+            report.built, report.skipped, report.installed, report.already_installed
+        ),
     ));
     Ok(report)
 }

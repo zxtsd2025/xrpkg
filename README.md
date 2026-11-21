@@ -31,8 +31,14 @@ The project currently targets the **LFS 12.1 baseline**: glibc 2.44, x86_64, and
 - **Lifecycle hooks**  
   `pre_install`, `post_install`, `pre_remove`, `post_remove`, `pre_upgrade`, and `post_upgrade` run inside an unprivileged chroot sandbox.
 
-- **Upgrade and explicit downgrade**  
-  Old files are backed up, obsolete files are removed, and failed transactions are rolled back.
+- **Metadata fidelity**  
+  SUID/SGID bits, ownership, and extended attributes (including `security.capability`) survive extraction, native packaging, and publication. Both GNU tar `SCHILY.xattr.*` and libarchive `LIBARCHIVE.xattr.*` PAX records are decoded.
+
+- **Atomic transactions and crash recovery**  
+  Every published file is written to a temporary file, fully synced, and moved into place with `rename(2)`. Old files are snapshotted under `<root>/.xrpkg-txn`; failures restore them, and a journal plus database-state check recovers after power loss.
+
+- **Upgrade, downgrade, and uninstall rollback**  
+  Old files are snapshotted, obsolete files are removed transactionally, and failed hooks or database commits restore both the filesystem and the previous package record.
 
 - **OpenPGP repository signing**  
   Indexes and packages use detached `.sig` files verified against an explicit trusted keyring.
@@ -41,7 +47,13 @@ The project currently targets the **LFS 12.1 baseline**: glibc 2.44, x86_64, and
   Build and package steps run in a user/mount namespace with a read-only `/usr`, private `/tmp`, and bound source/output directories.
 
 - **Arch repository sync and compatibility install**  
-  Parse a Pacman `core.db`, download `.pkg.tar.zst` files concurrently, run the ABI guard, and install `origin = "arch"` packages through the compatibility track.
+  Parse a Pacman `core.db`, download `.pkg.tar.zst` files concurrently, run the ABI guard, and install `origin = "arch"` packages through the compatibility track. External upgrades and uninstalls use the same transactional snapshots as native packages.
+
+- **Local `.xpkg` install**  
+  `xrpkg install ./foo.xpkg` validates metadata, preflights dependencies, runs the ABI guard, and commits through the same transaction path as repository installs.
+
+- **Standardized, localized CLI output**  
+  Chinese/English is selected from `LC_ALL`/`LC_MESSAGES`/`LANG`; non-UTF-8 terminals automatically fall back to ASCII English. Actions use `::`, `->`, `[ok]`, `warning:`, and `error:`, with aligned tables; colors only appear on a TTY. `--help`, `--version`, and `list` are first-class commands.
 
 - **Concurrent downloads with colored progress bars**  
   Per-package bars show speed, bytes, percentage, and ETA; they hide automatically when stderr is not a TTY.
@@ -113,9 +125,15 @@ xrpkg --build recipes/hello.toml \
   --db /tmp/xrpkg-root/local.db
 ```
 
-The default target root is `/var/tmp/xrpkg-rootfs`, and the default database is `var/lib/xrpkg/local.db`.
+Install a local `.xpkg` directly:
 
-The installed package list is printed after install, remove, build, and other state-changing operations.
+```sh
+xrpkg install ./hello-1.0.xpkg   --root /tmp/xrpkg-root   --db /tmp/xrpkg-root/local.db
+```
+
+The default target root is `/var/tmp/xrpkg-rootfs`. When run from the build tree, the default database is `var/lib/xrpkg/local.db`; an installed binary such as `/usr/bin/xrpkg` uses `/var/lib/xrpkg/local.db` instead.
+
+Use `xrpkg list` to inspect installed packages; `xrpkg --help` shows all commands. State-changing operations print a compact transaction summary instead of dumping the whole database.
 
 Remove a package:
 
@@ -341,9 +359,12 @@ src/
   main.rs        CLI and command dispatch
   builder.rs     source recipes, sandbox, logging
   installer.rs   staging, ABI checks, upgrade transactions
+  fs_meta.rs     permissions, ownership, xattrs, and PAX decoding
+  transaction.rs atomic publish, snapshots, journal, crash recovery
   hooks.rs       lifecycle hooks and hook sandbox
   repo.rs        repository indexes, cache, downloads, cleanup
   download.rs    streaming HTTP/local downloads and progress bars
+  ui.rs          localized CLI output, tables, help, and color policy
   mirrors.rs     config/mirrors.toml loading and priority resolution
   sync.rs        Arch core.db sync and parallel ingest
   sign.rs        OpenPGP detached signatures
@@ -380,7 +401,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Current local result: **131 tests passed across 27 test targets**. Some tests require `unshare`, user namespaces, `gpg`, and `zstd`.
+Current local result: **174 tests passed across 32 test targets**. Some tests require `unshare`, user namespaces, `gpg`, `setcap` (root-only capability test), and `zstd`.
 
 ### Security model and scope
 
@@ -429,10 +450,14 @@ The build sandbox isolates mounts and the filesystem view, but it is not a virtu
 - **SQLite 状态**：`installed_packages`、`installed_files`、`installed_hooks` 是卸载和升级的唯一事实来源。
 - **ABI 守门**：发布到目标 Rootfs 前检查 ELF 的 GLIBC 符号版本。
 - **生命周期 hooks**：`pre_install`、`post_install`、`pre_remove`、`post_remove`、`pre_upgrade`、`post_upgrade` 在非特权 chroot 沙箱中执行。
-- **升级与显式降级**：备份旧文件、清理废弃文件，失败时回滚。
+- **元数据保真**：解包、原生打包和发布都会保留 SUID/SGID、属主和扩展属性（包括 `security.capability`）；同时解析 GNU tar `SCHILY.xattr.*` 与 libarchive `LIBARCHIVE.xattr.*` 两种 PAX 记录。
+- **原子事务与崩溃恢复**：每个待发布文件先写入临时文件并 `fsync`，再用 `rename(2)` 原子替换。旧文件快照保存在 `<root>/.xrpkg-txn`；失败时恢复，断电后由日志加数据库状态自动判定提交或回滚。
+- **升级、降级与卸载回滚**：旧文件进入快照，废弃文件在事务内清理；hook 或数据库提交失败时，文件系统和旧包记录一起恢复。
 - **OpenPGP 仓库签名**：索引和包使用分离 `.sig`，按显式信任 keyring 验证。
 - **隔离构建沙箱**：user/mount namespace、只读 `/usr`、独立 `/tmp`、绑定源码和输出目录。
-- **Arch 仓库同步与兼容安装**：解析 Pacman `core.db`，并发下载 `.pkg.tar.zst`，通过 ABI 守门后按 `origin = "arch"` 走兼容轨道安装。
+- **Arch 仓库同步与兼容安装**：解析 Pacman `core.db`，并发下载 `.pkg.tar.zst`，通过 ABI 守门后按 `origin = "arch"` 走兼容轨道安装。外部包的升级与卸载同样使用事务快照。
+- **本地 `.xpkg` 安装**：`xrpkg install ./foo.xpkg` 会校验元数据、预检依赖、运行 ABI 守门，并走与仓库安装相同的提交事务。
+- **标准化、多语言 CLI**：根据 `LC_ALL`/`LC_MESSAGES`/`LANG` 选择中文或英文；非 UTF-8 终端自动回退到 ASCII 英文，避免方块。操作使用 `::`、`->`、`[ok]`、`warning:`、`error:` 和自动对齐表格；颜色只在 TTY 下启用。`--help`、`--version`、`list` 是一等命令。
 - **并发下载与彩色进度条**：每个包显示速度、字节数、百分比和 ETA；stderr 不是终端时自动隐藏。
 - **LFS 配方**：`hello`、`zlib`、`binutils`、`glibc`、`gcc`、`linux`、`bash`、`coreutils`。
 
@@ -500,9 +525,17 @@ xrpkg --build recipes/hello.toml \
   --db /tmp/xrpkg-root/local.db
 ```
 
-默认 Rootfs 是 `/var/tmp/xrpkg-rootfs`，默认数据库是 `var/lib/xrpkg/local.db`。
+直接安装本地 `.xpkg`：
 
-安装、卸载、构建等状态变更操作结束后会打印已安装包列表。
+```sh
+xrpkg install ./hello-1.0.xpkg \
+  --root /tmp/xrpkg-root \
+  --db /tmp/xrpkg-root/local.db
+```
+
+默认 Rootfs 是 `/var/tmp/xrpkg-rootfs`。从构建目录运行时默认数据库是 `var/lib/xrpkg/local.db`；安装到 `/usr/bin/xrpkg` 后默认使用 `/var/lib/xrpkg/local.db`。
+
+用 `xrpkg list` 查看已安装包；`xrpkg --help` 显示全部命令。状态变更操作只打印紧凑的事务摘要，不再倾倒整个数据库。
 
 卸载：
 
@@ -728,9 +761,12 @@ src/
   main.rs        CLI 与命令分发
   builder.rs     源码配方、沙箱、日志
   installer.rs   暂存、ABI 校验、升级事务
+  fs_meta.rs     权限、属主、扩展属性与 PAX 解码
+  transaction.rs 原子发布、快照、日志与崩溃恢复
   hooks.rs       生命周期 hooks 与 hook 沙箱
   repo.rs        仓库索引、缓存、下载、清理
   download.rs    统一下载与进度条
+  ui.rs          多语言 CLI 输出、表格、帮助与颜色策略
   mirrors.rs     config/mirrors.toml 加载与优先级解析
   sync.rs        Arch core.db 同步与并发入库
   sign.rs        OpenPGP 分离签名
@@ -767,7 +803,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-当前本地结果：**27 个测试目标、131 个测试通过**。部分测试需要 `unshare`、user namespace、`gpg` 和 `zstd`。
+当前本地结果：**32 个测试目标、174 个测试通过**。部分测试需要 `unshare`、user namespace、`gpg`、`setcap`（root-only capability 用例）和 `zstd`。
 
 ### 安全模型与边界
 

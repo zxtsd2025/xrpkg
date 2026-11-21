@@ -19,8 +19,9 @@ use liblzma::read::XzDecoder;
 
 use crate::capability::Capability;
 use crate::deps_map::DependencyMapper;
+use crate::fs_meta::EntryMetadata;
 use crate::hooks::{HookScript, POST_INSTALL, POST_REMOVE, PRE_INSTALL, PRE_REMOVE};
-use crate::xpkg::{ensure_directory, sanitize_relative, write_file, Rootfs};
+use crate::xpkg::{ensure_directory_with_metadata, sanitize_relative, write_file, Rootfs};
 
 /// 本模块使用的错误类型；当前统一用可读字符串。
 pub type Error = String;
@@ -146,11 +147,12 @@ pub fn extract_deb_data(deb_path: &Path, target_rootfs: &Path) -> Result<Vec<Pat
         }
 
         if entry_type.is_dir() {
-            ensure_directory(rootfs.path(), &relative)?;
+            let metadata = EntryMetadata::from_tar(&mut entry)?;
+            ensure_directory_with_metadata(rootfs.path(), &relative, &metadata)?;
         } else if entry_type.is_file() {
             let size = entry.size();
-            let mode = entry.header().mode().unwrap_or(0o644);
-            write_file(rootfs.path(), &relative, &mut entry, size, mode)?;
+            let metadata = EntryMetadata::from_tar(&mut entry)?;
+            write_file(rootfs.path(), &relative, &mut entry, size, &metadata)?;
             installed.insert(relative);
         } else if entry_type.is_symlink() {
             return Err(format!(

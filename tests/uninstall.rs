@@ -100,3 +100,45 @@ fn stops_before_database_cleanup_when_a_file_cannot_be_removed() {
     assert_eq!(db.list_files("broken").unwrap(), ["protected"]);
     assert!(rootfs.path().join("protected").is_dir());
 }
+
+#[test]
+fn failed_post_remove_restores_files_and_database() {
+    let temp = TempDir::new().unwrap();
+    let rootfs = Rootfs::prepare(temp.path().join("rootfs")).unwrap();
+    write_file(rootfs.path(), "usr/bin/a", b"payload");
+    let mut db = LocalDb::open(":memory:").unwrap();
+    let mut package = install("a", &["usr/bin/a"]);
+    package.hooks.push(xrpkg::hooks::HookScript {
+        phase: "post_remove".to_string(),
+        script: b"exit 1\n".to_vec(),
+    });
+    db.commit(&[package]).unwrap();
+
+    let error = remove_package(&mut db, &rootfs, "a", false).unwrap_err();
+
+    assert!(
+        error.contains("post_remove") || error.contains("hook"),
+        "{error}"
+    );
+    assert!(rootfs.path().join("usr/bin/a").is_file());
+    assert_eq!(
+        fs::read(rootfs.path().join("usr/bin/a")).unwrap(),
+        b"payload"
+    );
+    assert!(db.package_exists("a").unwrap());
+    assert_eq!(db.list_files("a").unwrap(), ["usr/bin/a"]);
+}
+
+#[test]
+fn refuses_to_drop_database_records_when_rootfs_is_wrong() {
+    let temp = TempDir::new().unwrap();
+    let rootfs = Rootfs::prepare(temp.path().join("empty-rootfs")).unwrap();
+    let mut db = LocalDb::open(":memory:").unwrap();
+    db.commit(&[install("ghost", &["usr/bin/ghost"])]).unwrap();
+
+    let error = remove_package(&mut db, &rootfs, "ghost", false).unwrap_err();
+
+    assert!(error.contains("找不到"), "{error}");
+    assert!(db.package_exists("ghost").unwrap());
+    assert_eq!(db.list_files("ghost").unwrap(), ["usr/bin/ghost"]);
+}

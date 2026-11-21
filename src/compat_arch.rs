@@ -11,9 +11,11 @@ use std::path::{Component, Path, PathBuf};
 use crate::abi::AbiGuard;
 use crate::capability::Capability;
 use crate::deps_map::DependencyMapper;
+use crate::fs_meta::{self, EntryMetadata};
 use crate::hooks::{HookScript, POST_INSTALL, POST_REMOVE, PRE_INSTALL, PRE_REMOVE};
 use crate::xpkg::{
-    create_hard_link, create_symlink, ensure_directory, sanitize_relative, write_file, Rootfs,
+    create_hard_link, create_symlink, ensure_directory_with_metadata, sanitize_relative,
+    write_file, Rootfs,
 };
 
 /// 本模块使用的错误类型；当前统一用可读字符串。
@@ -202,18 +204,21 @@ pub fn extract_arch_data(arch_path: &Path, target_rootfs: &Path) -> Result<Vec<P
 
         let entry_type = entry.header().entry_type();
         if entry_type.is_dir() {
-            ensure_directory(rootfs.path(), &relative)?;
+            let metadata = EntryMetadata::from_tar(&mut entry)?;
+            ensure_directory_with_metadata(rootfs.path(), &relative, &metadata)?;
         } else if entry_type.is_file() {
             let size = entry.size();
-            let mode = entry.header().mode().unwrap_or(0o644);
-            write_file(rootfs.path(), &relative, &mut entry, size, mode)?;
+            let metadata = EntryMetadata::from_tar(&mut entry)?;
+            write_file(rootfs.path(), &relative, &mut entry, size, &metadata)?;
             installed.insert(relative);
         } else if entry_type == tar::EntryType::Symlink {
+            let metadata = EntryMetadata::from_tar(&mut entry)?;
             let link_target = entry
                 .link_name()
                 .map_err(|error| format!("读取符号链接目标 `{}` 失败: {error}", path.display()))?
                 .ok_or_else(|| format!("符号链接 `{}` 缺少目标", path.display()))?;
             create_symlink(rootfs.path(), &relative, link_target.as_ref())?;
+            fs_meta::apply_symlink_metadata(&rootfs.path().join(&relative), &metadata)?;
             installed.insert(relative);
         } else if entry_type == tar::EntryType::Link {
             let link_name = entry

@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::Deserialize;
 
 use crate::capability::{Capability, Version};
+use crate::fs_meta::{self, EntryMetadata};
 use crate::hooks::{HookScript, ALL_PHASES};
 use crate::solver::SelectedPackage;
 
@@ -188,19 +189,42 @@ pub fn install_package(
 
 /// 把暂存 Rootfs 中通过 ABI 检查的文件发布到真实 Rootfs。
 ///
-/// 文件先解包到暂存区，ABI 守门员全部通过后才调用本函数；因此 ABI 失败时
-/// 目标 Rootfs 不会被改动。
+/// 兼容测试和独立工具使用的一次性接口；正式安装应使用
+/// [`publish_files_txn`]，把发布纳入更大的数据库事务。
 pub fn publish_files(staging: &Rootfs, target: &Rootfs, files: &[String]) -> Result<(), String> {
+    let mut transaction = crate::transaction::Transaction::begin(target, None)?;
+    publish_files_txn(&mut transaction, staging, files)?;
+    transaction.commit();
+    Ok(())
+}
+
+/// 事务化发布：每个文件先写临时文件，再原子 rename 到目标。
+///
+/// 普通文件保留硬链接关系；符号链接在第二遍发布，确保其指向的文件已经存在。
+pub fn publish_files_txn(
+    transaction: &mut crate::transaction::Transaction,
+    staging: &Rootfs,
+    files: &[String],
+) -> Result<(), String> {
+    let target = transaction.root().to_path_buf();
     let mut regular_files = Vec::new();
     let mut symlinks = Vec::new();
     for file in files {
         let relative = sanitize_relative(Path::new(file))
             .map_err(|error| format!("文件清单中的路径 `{file}` 非法: {error}"))?;
+        if relative
+            .components()
+            .next()
+            .is_some_and(|component| component.as_os_str() == crate::transaction::TXN_DIR)
+        {
+            return Err(format!("文件路径 `{file}` 占用了保留目录 `.xrpkg-txn`"));
+        }
         let source = staging.path().join(&relative);
         let metadata = fs::symlink_metadata(&source)
             .map_err(|error| format!("读取暂存文件 `{}` 失败: {error}", source.display()))?;
         if metadata.file_type().is_symlink() {
-            symlinks.push((relative, source));
+            let link_metadata = fs_meta::read_metadata(&source)?;
+            symlinks.push((relative, source, link_metadata));
         } else if metadata.is_file() {
             regular_files.push((relative, source, metadata));
         } else {
@@ -216,12 +240,9 @@ pub fn publish_files(staging: &Rootfs, target: &Rootfs, files: &[String]) -> Res
     for (relative, source, source_metadata) in regular_files {
         if let Some(parent) = relative.parent() {
             if !parent.as_os_str().is_empty() {
-                ensure_directory(target.path(), parent)?;
+                ensure_directory(&target, parent)?;
             }
         }
-
-        let destination = target.path().join(&relative);
-        ensure_publish_destination(&destination)?;
 
         #[cfg(unix)]
         {
@@ -230,35 +251,22 @@ pub fn publish_files(staging: &Rootfs, target: &Rootfs, files: &[String]) -> Res
             if source_metadata.nlink() > 1 {
                 let key = (source_metadata.dev(), source_metadata.ino());
                 if let Some(origin) = hardlinks.get(&key) {
-                    ensure_hardlink_destination(&destination)?;
-                    fs::hard_link(origin, &destination).map_err(|error| {
-                        format!(
-                            "发布硬链接 `{}` -> `{}` 失败: {error}",
-                            origin.display(),
-                            destination.display()
-                        )
-                    })?;
+                    transaction.install_hardlink(&relative, origin)?;
                     continue;
                 }
-                hardlinks.insert(key, destination.clone());
+                hardlinks.insert(key, relative.clone());
             }
         }
 
-        fs::copy(&source, &destination).map_err(|error| {
-            format!(
-                "发布文件 `{}` -> `{}` 失败: {error}",
-                source.display(),
-                destination.display()
-            )
-        })?;
-        set_published_mode(&destination, &source_metadata)?;
+        transaction.install_file(&relative, &source)?;
     }
 
     // 第二遍发布符号链接，确保链接指向的普通文件已经存在。
-    for (relative, source) in symlinks {
+    for (relative, source, metadata) in symlinks {
         let link_target = fs::read_link(&source)
             .map_err(|error| format!("读取暂存符号链接 `{}` 失败: {error}", source.display()))?;
-        create_symlink(target.path(), &relative, &link_target)?;
+        validate_symlink_target(&target, &relative, &link_target)?;
+        transaction.install_symlink(&relative, &link_target, Some(&metadata))?;
     }
 
     Ok(())
@@ -280,27 +288,6 @@ fn ensure_publish_destination(destination: &Path) -> Result<(), String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!(
             "检查目标文件 `{}` 失败: {error}",
-            destination.display()
-        )),
-    }
-}
-
-/// 硬链接发布前删除同名旧文件；目录仍然拒绝，避免误删目录树。
-fn ensure_hardlink_destination(destination: &Path) -> Result<(), String> {
-    match fs::symlink_metadata(destination) {
-        Ok(metadata) if metadata.is_dir() => Err(format!(
-            "目标文件 `{}` 是目录，拒绝创建硬链接",
-            destination.display()
-        )),
-        Ok(_) => fs::remove_file(destination).map_err(|error| {
-            format!(
-                "删除硬链接目标旧文件 `{}` 失败: {error}",
-                destination.display()
-            )
-        }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "检查硬链接目标 `{}` 失败: {error}",
             destination.display()
         )),
     }
@@ -391,18 +378,21 @@ fn extract_files(archive: &Path, rootfs: &Rootfs) -> Result<Vec<String>, String>
             return Err(format!("包内出现重复路径 `{}`", path.display()));
         }
         if entry_type.is_dir() {
-            ensure_directory(rootfs.path(), &relative)?;
+            let metadata = EntryMetadata::from_tar(&mut entry)?;
+            ensure_directory_with_metadata(rootfs.path(), &relative, &metadata)?;
         } else if entry_type.is_file() {
             let size = entry.size();
-            let mode = entry.header().mode().unwrap_or(0o644);
-            write_file(rootfs.path(), &relative, &mut entry, size, mode)?;
+            let metadata = EntryMetadata::from_tar(&mut entry)?;
+            write_file(rootfs.path(), &relative, &mut entry, size, &metadata)?;
             installed.insert(path_for_database(&relative));
         } else if entry_type == tar::EntryType::Symlink {
+            let metadata = EntryMetadata::from_tar(&mut entry)?;
             let link_target = entry
                 .link_name()
                 .map_err(|error| format!("读取符号链接目标 `{}` 失败: {error}", path.display()))?
                 .ok_or_else(|| format!("符号链接 `{}` 缺少目标", path.display()))?;
             create_symlink(rootfs.path(), &relative, link_target.as_ref())?;
+            fs_meta::apply_symlink_metadata(&rootfs.path().join(&relative), &metadata)?;
             installed.insert(path_for_database(&relative));
         } else if entry_type == tar::EntryType::Link {
             let link_name = entry
@@ -643,7 +633,7 @@ fn resolve_link_target(link_relative: &Path, target: &Path) -> Result<PathBuf, S
 }
 
 /// 只允许普通路径组件，拒绝 `..`、`.`、绝对路径和盘符。
-pub(crate) fn sanitize_relative(path: &Path) -> Result<PathBuf, String> {
+pub fn sanitize_relative(path: &Path) -> Result<PathBuf, String> {
     let mut cleaned = PathBuf::new();
     for component in path.components() {
         match component {
@@ -689,13 +679,23 @@ pub(crate) fn ensure_directory(root: &Path, relative: &Path) -> Result<(), Strin
     Ok(())
 }
 
+/// 创建目录并应用包内记录的权限位。
+pub(crate) fn ensure_directory_with_metadata(
+    root: &Path,
+    relative: &Path,
+    metadata: &EntryMetadata,
+) -> Result<(), String> {
+    ensure_directory(root, relative)?;
+    fs_meta::apply_metadata(&root.join(relative), metadata)
+}
+
 /// 安全写入普通文件，并拒绝覆盖已有符号链接。
 pub(crate) fn write_file(
     root: &Path,
     relative: &Path,
     entry: &mut impl Read,
     expected_size: u64,
-    archive_mode: u32,
+    metadata: &EntryMetadata,
 ) -> Result<(), String> {
     if let Some(parent) = relative.parent() {
         if !parent.as_os_str().is_empty() {
@@ -735,7 +735,7 @@ pub(crate) fn write_file(
         ));
     }
 
-    set_file_mode(&target, archive_mode)
+    fs_meta::apply_metadata(&target, metadata)
 }
 
 /// 把归档里的普通相对路径转换成数据库中的 `/` 分隔路径。
@@ -744,39 +744,6 @@ fn path_for_database(path: &Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
-}
-
-#[cfg(unix)]
-/// 用源文件权限覆盖目标文件，保持 0644 / 0755。
-fn set_published_mode(path: &Path, source_metadata: &fs::Metadata) -> Result<(), String> {
-    fs::set_permissions(path, source_metadata.permissions())
-        .map_err(|error| format!("设置发布文件权限 `{}` 失败: {error}", path.display()))
-}
-
-#[cfg(not(unix))]
-/// 非 Unix 平台不做额外权限处理。
-fn set_published_mode(_path: &Path, _source_metadata: &fs::Metadata) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(unix)]
-/// 普通文件只保留 0644 / 0755，去掉 setuid 等危险位。
-fn set_file_mode(path: &Path, archive_mode: u32) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mode = if archive_mode & 0o111 != 0 {
-        0o755
-    } else {
-        0o644
-    };
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .map_err(|error| format!("设置文件权限 `{}` 失败: {error}", path.display()))
-}
-
-#[cfg(not(unix))]
-/// 非 Unix 平台不处理权限位。
-fn set_file_mode(_path: &Path, _archive_mode: u32) -> Result<(), String> {
-    Ok(())
 }
 
 #[cfg(unix)]

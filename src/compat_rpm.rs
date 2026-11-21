@@ -11,6 +11,7 @@ use rpm::{FileType, Package, PackageMetadata};
 
 use crate::capability::Capability;
 use crate::deps_map::DependencyMapper;
+use crate::fs_meta::EntryMetadata;
 use crate::hooks::{HookScript, POST_INSTALL, POST_REMOVE, PRE_INSTALL, PRE_REMOVE};
 use crate::xpkg::{ensure_directory, sanitize_relative, write_file, Rootfs};
 
@@ -143,14 +144,14 @@ pub fn extract_rpm_data(rpm_path: &Path, target_rootfs: &Path) -> Result<Vec<Pat
                     // Ghost 文件只在头里存在，没有载荷内容，不落盘。
                     continue;
                 };
-                let mode = file.metadata.permissions() as u32;
+                let metadata = EntryMetadata::from_mode(file.metadata.permissions() as u32);
                 let mut reader = Cursor::new(content);
                 write_file(
                     rootfs.path(),
                     &relative,
                     &mut reader,
                     content.len() as u64,
-                    mode,
+                    &metadata,
                 )?;
                 installed.insert(relative);
             }

@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::ui;
 use crate::xpkg::Rootfs;
 
 /// 本模块使用的错误类型；当前统一用可读字符串。
@@ -51,7 +52,10 @@ pub fn run_hook(
     rootfs: &Rootfs,
     script: &[u8],
 ) -> Result<(), Error> {
-    println!("==> 执行 {phase} hook: {package_name} {package_version}");
+    ui::step(&ui::pick(
+        format!("执行 {phase} hook: {package_name} {package_version}"),
+        format!("Running {phase} hook: {package_name} {package_version}"),
+    ));
     let sandbox = Sandbox::create(rootfs, package_name, package_version, script)?;
     let output = Command::new("unshare")
         .args([

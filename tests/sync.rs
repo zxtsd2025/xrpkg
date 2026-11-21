@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -84,6 +86,7 @@ fn bad_elf() -> Vec<u8> {
 
 #[test]
 fn syncs_good_packages_and_filters_baseline_violations() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let mirror = temp.path().join("mirror");
     fs::create_dir_all(&mirror).unwrap();
@@ -187,6 +190,7 @@ fn syncs_good_packages_and_filters_baseline_violations() {
 
 #[test]
 fn abi_guard_blocks_bad_elf_from_entering_repo() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let mirror = temp.path().join("mirror");
     fs::create_dir_all(&mirror).unwrap();
@@ -222,6 +226,7 @@ fn abi_guard_blocks_bad_elf_from_entering_repo() {
 }
 #[test]
 fn cli_sync_all_reads_mirrors_config_and_stays_quiet_without_tty() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let mirror = temp.path().join("mirror");
     fs::create_dir_all(&mirror).unwrap();

@@ -45,6 +45,7 @@ fn write_config(path: &Path, repos: &[(&str, &Path)], keyring: &Path) {
 
 #[test]
 fn installs_a_and_dependency_b_from_a_local_repository() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let repo_dir = temp.path().join("repo");
     let gpg = common::TestGpg::new(temp.path());
@@ -88,6 +89,7 @@ fn installs_a_and_dependency_b_from_a_local_repository() {
 
 #[test]
 fn first_configured_repository_wins_for_the_same_package_name() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let repo_one = temp.path().join("repo-one");
     let repo_two = temp.path().join("repo-two");
@@ -125,6 +127,7 @@ fn first_configured_repository_wins_for_the_same_package_name() {
 
 #[test]
 fn package_download_failure_does_not_touch_database_or_rootfs() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let repo_dir = temp.path().join("repo");
     let gpg = common::TestGpg::new(temp.path());
@@ -161,6 +164,7 @@ fn package_download_failure_does_not_touch_database_or_rootfs() {
 
 #[test]
 fn local_repository_index_is_cacheable() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let repo_dir = temp.path().join("repo");
     let gpg = common::TestGpg::new(temp.path());
@@ -182,6 +186,7 @@ fn local_repository_index_is_cacheable() {
 }
 #[test]
 fn supports_legacy_repo_table_configuration() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let repo_dir = temp.path().join("core");
     let gpg = common::TestGpg::new(temp.path());
@@ -209,6 +214,7 @@ fn supports_legacy_repo_table_configuration() {
 
 #[test]
 fn install_pkg_equals_version_requires_allow_downgrade() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let repo_dir = temp.path().join("repo");
     let gpg = common::TestGpg::new(temp.path());

@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -66,6 +68,7 @@ fn options(log: PathBuf) -> WorldOptions {
 
 #[test]
 fn builds_in_order_then_resumes_from_existing_archives() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     write_recipe(temp.path(), "alpha", "1.0", &[]);
     write_recipe(temp.path(), "beta", "2.0", &[]);
@@ -123,6 +126,7 @@ fn builds_in_order_then_resumes_from_existing_archives() {
 
 #[test]
 fn failure_stops_later_packages_and_is_logged() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     write_recipe(temp.path(), "broken", "1.0", &["exit 3"]);
     write_recipe(temp.path(), "later", "1.0", &[]);
@@ -154,6 +158,7 @@ fn failure_stops_later_packages_and_is_logged() {
 
 #[test]
 fn rejects_an_empty_system_configuration() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let config = write_system_config(temp.path(), &[]);
     let paths = paths(&temp);
@@ -171,6 +176,7 @@ fn rejects_an_empty_system_configuration() {
 
 #[test]
 fn linux_recipe_forces_nvme_ext4_efi_and_devtmpfs_builtin() {
+    common::isolate_cache();
     let recipe_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("recipes/linux.toml");
     let recipe = fs::read_to_string(recipe_path).unwrap();
 

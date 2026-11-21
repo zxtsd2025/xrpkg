@@ -15,6 +15,7 @@ use crate::hooks::{
 use crate::solver::SelectedPackage;
 use crate::state::{LocalDb, PackageInstall};
 use crate::transaction::{self, Transaction};
+use crate::triggers;
 use crate::ui;
 use crate::xpkg::{self, Rootfs};
 
@@ -182,9 +183,9 @@ pub fn install_changes(
         .iter()
         .flat_map(|install| install.files.iter().cloned())
         .collect::<BTreeSet<_>>();
-    let directories =
+    let (removed_files, directories) =
         match remove_obsolete_files(db, &mut transaction, &installs, &upgrades, &new_files) {
-            Ok(directories) => directories,
+            Ok(result) => result,
             Err(error) => {
                 let rollback = transaction.rollback();
                 return Err(join_rollback(error, rollback));
@@ -224,6 +225,11 @@ pub fn install_changes(
     }
     transaction.commit();
     let _ = transaction::remove_empty_directories(rootfs.path(), &directories);
+    let removed_for_triggers = removed_files
+        .iter()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect::<Vec<_>>();
+    triggers::after_install(&rootfs, &all_files, &removed_for_triggers, no_hooks);
     let package_count = ui::count(installs.len(), "package", "packages", "个包");
     ui::ok(&ui::pick(
         format!("提交完成: 已写入 {package_count}"),
@@ -274,14 +280,15 @@ fn run_old_phase(
 
 /// 清理旧版本有、新版本没有，且未被其他包/本次其他新包引用的文件。
 ///
-/// 文件先移入事务快照而不是直接删除；返回需要提交后清理的父目录。
+/// 文件先移入事务快照而不是直接删除；返回被删除的相对路径和需要在提交后
+/// 清理的父目录。
 fn remove_obsolete_files(
     db: &LocalDb,
     transaction: &mut Transaction,
     installs: &[PackageInstall],
     upgrades: &[Upgrade],
     new_files: &BTreeSet<String>,
-) -> Result<BTreeSet<PathBuf>, String> {
+) -> Result<(Vec<PathBuf>, BTreeSet<PathBuf>), String> {
     let mut removed = Vec::new();
     for upgrade in upgrades {
         for file in &upgrade.old_files {
@@ -298,7 +305,8 @@ fn remove_obsolete_files(
             removed.push(relative);
         }
     }
-    Ok(transaction::parent_directories(removed))
+    let directories = transaction::parent_directories(removed.clone());
+    Ok((removed, directories))
 }
 
 fn join_rollback(error: String, rollback: Result<(), String>) -> String {

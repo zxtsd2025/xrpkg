@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::path::Path;
 
@@ -18,6 +20,7 @@ fn write_recipe(temp: &TempDir, body: &str) -> std::path::PathBuf {
 
 #[test]
 fn sandbox_clears_host_cflags_and_ldflags() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let recipe = write_recipe(
         &temp,
@@ -64,6 +67,7 @@ package = [
 
 #[test]
 fn sandbox_rejects_writes_to_etc_and_host_is_untouched() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let recipe = write_recipe(
         &temp,
@@ -83,6 +87,7 @@ package = ["touch \"$PKGDIR/should-not-exist\""]
 
 #[test]
 fn real_hello_and_zlib_build_in_sandbox() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let project = Path::new(env!("CARGO_MANIFEST_DIR"));
     let hello = build_package(
@@ -140,6 +145,7 @@ fn install_and_read(archive: &std::path::Path, rootfs: &std::path::Path, file: &
 
 #[test]
 fn makeflags_defaults_to_j8_and_can_be_overridden() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let source = temp.path().join("src");
     fs::create_dir_all(&source).unwrap();
@@ -217,6 +223,7 @@ MAKEFLAGS = "-j2"
 
 #[test]
 fn build_output_is_written_to_log_file() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let recipe = write_recipe(
         &temp,

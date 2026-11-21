@@ -49,18 +49,9 @@ CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo test
 
 - `cargo fmt --check` 通过；
 - `cargo clippy --all-targets -- -D warnings` 通过；
-- `cargo test`：32 个测试目标、174 个测试通过、0 失败。
+- `cargo test`：35 个测试目标、201 个测试通过、0 失败。测试会为每个测试二进制使用独立临时缓存目录，不再写 `~/.cache/xrpkg`。
 
-如果 `source_fetch` 的任一用例报 `Text file busy`（ETXTBSY），这是多个测试二进制并发共用 `~/.cache/xrpkg` 导致的既知环境抖动。先清理测试缓存再重跑：
-
-```sh
-rm -f ~/.cache/xrpkg/downloads/fetched-gzip.tar.gz \
-      ~/.cache/xrpkg/downloads/fetched-xz.tar.xz
-rm -rf ~/.cache/xrpkg/logs/*
-cargo test
-```
-
-如果仍然失败，保留完整输出并报告，不要把它当成产品功能通过。
+如果测试失败，保留完整输出并报告，不要把它当成产品功能通过。
 
 ### 3. 编译 release
 
@@ -154,7 +145,7 @@ xrpkg sync 2>&1 | head -n 3
 1) cd /home/zxtsd/xrpkg
 2) cargo fmt --check
 3) cargo clippy --all-targets -- -D warnings
-4) CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo test（期望 32 个测试目标、174 个测试通过；若 source_fetch 报 Text file busy，清理 ~/.cache/xrpkg/downloads/fetched-* 和 logs 后重跑）
+4) CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 cargo test（期望 35 个测试目标、201 个测试通过；测试使用独立临时缓存目录）
 5) cargo build --release --locked
 6) install -Dm755 target/release/xrpkg ~/.local/bin/xrpkg
 7) cargo test --test sync -- --nocapture

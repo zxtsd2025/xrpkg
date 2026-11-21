@@ -14,6 +14,7 @@ use xrpkg::compat_rpm;
 use xrpkg::deps_map::{default_config_path, DependencyMapper};
 use xrpkg::hooks::{self, HookScript, POST_INSTALL, PRE_INSTALL, PRE_REMOVE};
 use xrpkg::installer;
+use xrpkg::lock::ProcessLock;
 use xrpkg::metadata::load_repository;
 use xrpkg::mirrors;
 use xrpkg::repo;
@@ -23,6 +24,7 @@ use xrpkg::solver::{Package, SelectedPackage};
 use xrpkg::state::{InstalledPackage, LocalDb, PackageInstall};
 use xrpkg::sync;
 use xrpkg::transaction::{self, Transaction};
+use xrpkg::triggers;
 use xrpkg::ui;
 use xrpkg::uninstall;
 use xrpkg::world;
@@ -278,6 +280,24 @@ fn run() -> Result<(), String> {
         ui::print_help();
         return Ok(());
     }
+
+    // 会写目标 Rootfs 或数据库的命令先拿排他锁；只读命令不加锁。
+    // 锁必须在打开数据库、Rootfs::prepare 等任何写入之前获取，并持有到
+    // `run` 返回（包括安装后的 ldconfig/fc-cache 触发器）。
+    let needs_process_lock = cli.install.is_some()
+        || cli.remove.is_some()
+        || cli.build.is_some()
+        || cli.build_world
+        || cli.init
+        || foreign_count > 0;
+    let _process_lock = if needs_process_lock {
+        Some(ProcessLock::acquire(
+            &cli.rootfs,
+            &database_path(project_root, &cli),
+        )?)
+    } else {
+        None
+    };
 
     if cli.list {
         let db = LocalDb::open(database_path(project_root, &cli))?;
@@ -993,14 +1013,14 @@ fn find_external_upgrade(
     }))
 }
 
-/// 删除外部包旧版本有、新版本没有且未被共享的文件；返回提交后要清理的目录。
+/// 删除外部包旧版本有、新版本没有且未被共享的文件；返回删除路径和提交后要清理的目录。
 fn remove_external_obsolete(
     db: &LocalDb,
     transaction: &mut Transaction,
     package_name: &str,
     old_files: &[String],
     new_files: &[PathBuf],
-) -> Result<std::collections::BTreeSet<PathBuf>, String> {
+) -> Result<(Vec<PathBuf>, std::collections::BTreeSet<PathBuf>), String> {
     let new_files = new_files
         .iter()
         .map(|file| file.to_string_lossy().replace('\\', "/"))
@@ -1015,7 +1035,8 @@ fn remove_external_obsolete(
         transaction.remove_file(&relative)?;
         removed.push(relative);
     }
-    Ok(transaction::parent_directories(removed))
+    let directories = transaction::parent_directories(removed.clone());
+    Ok((removed, directories))
 }
 
 /// 外部兼容包的统一提交阶段：事务化发布、升级快照、hook 和数据库提交。
@@ -1034,8 +1055,12 @@ fn finish_external_install(
 ) -> Result<(), String> {
     let mut transaction = Transaction::begin(target, Some(db))?;
     transaction.record_install(name, version_raw, origin)?;
+    let publish_paths = files
+        .iter()
+        .map(|file| file.to_string_lossy().replace('\\', "/"))
+        .collect::<Vec<_>>();
 
-    let result = (|| -> Result<std::collections::BTreeSet<PathBuf>, String> {
+    let result = (|| -> Result<(Vec<PathBuf>, std::collections::BTreeSet<PathBuf>), String> {
         if !no_hooks {
             if let Some(old) = &old {
                 run_external_hooks(
@@ -1049,16 +1074,12 @@ fn finish_external_install(
             run_external_hooks(hooks, PRE_INSTALL, name, version_raw, target)?;
         }
 
-        let publish_paths = files
-            .iter()
-            .map(|file| file.to_string_lossy().replace('\\', "/"))
-            .collect::<Vec<_>>();
         xpkg::publish_files_txn(&mut transaction, staging, &publish_paths)?;
 
-        let directories = if let Some(old) = &old {
+        let (removed, directories) = if let Some(old) = &old {
             remove_external_obsolete(db, &mut transaction, name, &old.old_files, files)?
         } else {
-            std::collections::BTreeSet::new()
+            (Vec::new(), std::collections::BTreeSet::new())
         };
 
         if !no_hooks {
@@ -1066,13 +1087,18 @@ fn finish_external_install(
         }
 
         commit_external_package(db, name, version_raw, origin, files, hooks)?;
-        Ok(directories)
+        Ok((removed, directories))
     })();
 
     match result {
-        Ok(directories) => {
+        Ok((removed, directories)) => {
             transaction.commit();
             let _ = transaction::remove_empty_directories(target.path(), &directories);
+            let removed_for_triggers = removed
+                .iter()
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+                .collect::<Vec<_>>();
+            triggers::after_install(target, &publish_paths, &removed_for_triggers, no_hooks);
             Ok(())
         }
         Err(error) => {

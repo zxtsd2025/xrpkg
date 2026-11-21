@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
@@ -14,6 +16,7 @@ fn source_program() -> &'static str {
 
 #[test]
 fn builds_source_and_packages_only_pkgdir() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let source = temp.path().join("src");
     fs::create_dir(&source).unwrap();
@@ -95,6 +98,7 @@ package = [
 
 #[test]
 fn failed_build_does_not_emit_an_xpkg() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let source = temp.path().join("src");
     fs::create_dir(&source).unwrap();
@@ -123,6 +127,7 @@ package = []
 
 #[test]
 fn packages_and_installs_symlinks_and_hardlinks() {
+    common::isolate_cache();
     use std::os::unix::fs::MetadataExt;
     use xrpkg::xpkg::publish_files;
 
@@ -191,6 +196,7 @@ package = [
 
 #[test]
 fn passes_custom_environment_to_build_commands() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let source = temp.path().join("src");
     fs::create_dir(&source).unwrap();
@@ -239,6 +245,7 @@ XRPKG_TEST_VALUE = "from-recipe-env"
 
 #[test]
 fn packaging_preserves_suid_bits() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let source = temp.path().join("src");
     fs::create_dir(&source).unwrap();

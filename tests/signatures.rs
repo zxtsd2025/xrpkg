@@ -45,6 +45,7 @@ fn setup(temp: &TempDir) -> (PathBuf, common::TestGpg, PathBuf, PathBuf) {
 
 #[test]
 fn signed_package_and_index_install_successfully() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let (_, _, config, _) = setup(&temp);
     let cache = temp.path().join("cache");
@@ -63,6 +64,7 @@ fn signed_package_and_index_install_successfully() {
 
 #[test]
 fn tampered_package_with_recomputed_sha256_is_rejected() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let (repo_dir, gpg, config, package) = setup(&temp);
     let cache = temp.path().join("cache");
@@ -93,6 +95,7 @@ fn tampered_package_with_recomputed_sha256_is_rejected() {
 
 #[test]
 fn unsigned_repository_index_is_rejected() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let repo_dir = temp.path().join("repo");
     let gpg = common::TestGpg::new(temp.path());
@@ -110,6 +113,7 @@ fn unsigned_repository_index_is_rejected() {
 
 #[test]
 fn package_signed_by_another_key_is_rejected() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let (repo_dir, _gpg, config, _) = setup(&temp);
     let other = common::TestGpg::new(&temp.path().join("other"));
@@ -133,6 +137,7 @@ fn package_signed_by_another_key_is_rejected() {
 }
 #[test]
 fn repo_add_with_key_and_repo_sign_cli_create_detached_signatures() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let gpg = common::TestGpg::new(temp.path());
     let package = build_fixture(&temp, "cli-signed");
@@ -177,6 +182,7 @@ fn repo_add_with_key_and_repo_sign_cli_create_detached_signatures() {
 }
 #[test]
 fn missing_package_signature_is_rejected() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let (repo_dir, _, config, _) = setup(&temp);
     let cache = temp.path().join("cache");

@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::io::Write;
 use std::process::Command;
@@ -88,6 +90,7 @@ fn build_and_install(recipe: &std::path::Path, output_dir: &std::path::Path, tem
 
 #[test]
 fn fetches_and_extracts_tar_gz_from_file_url() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let tar = hello_source_tar();
     let archive = temp.path().join("fetched-gzip.tar.gz");
@@ -107,6 +110,7 @@ fn fetches_and_extracts_tar_gz_from_file_url() {
 
 #[test]
 fn detects_and_extracts_tar_xz_from_local_path() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let tar = hello_source_tar();
     let archive = temp.path().join("fetched-xz.tar.xz");
@@ -130,6 +134,7 @@ fn detects_and_extracts_tar_xz_from_local_path() {
 
 #[test]
 fn hash_mismatch_aborts_before_build_or_packaging() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let archive = temp.path().join("hello.tar.gz");
     fs::write(&archive, gzip(&hello_source_tar())).unwrap();

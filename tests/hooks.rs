@@ -1,3 +1,5 @@
+mod common;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -70,6 +72,7 @@ fn install_one(temp: &TempDir, name: &str, archive: &Path, no_hooks: bool) -> Re
 
 #[test]
 fn post_install_runs_inside_the_target_rootfs() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let script =
         "mkdir -p \"$XRPKG_ROOTFS/etc\"\necho configured > \"$XRPKG_ROOTFS/etc/marker.txt\"\n";
@@ -85,6 +88,7 @@ fn post_install_runs_inside_the_target_rootfs() {
 
 #[test]
 fn failed_post_install_rolls_back_files_and_database() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let archive = build_hooked_package(&temp, "hook-fail", Some("exit 1\n"));
 
@@ -99,6 +103,7 @@ fn failed_post_install_rolls_back_files_and_database() {
 
 #[test]
 fn no_hooks_skips_execution_but_keeps_scripts_in_database() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let script =
         "mkdir -p \"$XRPKG_ROOTFS/etc\"\necho configured > \"$XRPKG_ROOTFS/etc/marker.txt\"\n";
@@ -110,6 +115,7 @@ fn no_hooks_skips_execution_but_keeps_scripts_in_database() {
 }
 #[test]
 fn pre_and_post_remove_hooks_run_around_uninstall() {
+    common::isolate_cache();
     use xrpkg::uninstall::remove_package;
 
     let temp = TempDir::new().unwrap();
@@ -178,6 +184,7 @@ post_remove = "hook-remove-post.sh"
 }
 #[test]
 fn hook_sandbox_cannot_write_to_host_etc() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let host_marker = std::path::Path::new("/etc/xrpkg-hook-host-escape.txt");
     let _ = fs::remove_file(host_marker);

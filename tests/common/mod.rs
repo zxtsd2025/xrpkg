@@ -1,6 +1,31 @@
+//! 测试共享工具。
+//!
+//! 每个测试二进制都会编译整个模块；只用到其中一部分属于正常情况。
+#![allow(dead_code)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
+
+use tempfile::TempDir;
+
+/// 当前测试二进制独占的缓存根；进程存活期间不会被删除。
+static TEST_CACHE_ROOT: OnceLock<TempDir> = OnceLock::new();
+
+/// 为当前测试二进制建立独立缓存根，并让 `builder::cache_root` 指向它。
+///
+/// 每个测试二进制是独立进程，因此 `OnceLock` 只需初始化一次；同一二进制内
+/// 的测试共享该目录，不会和并行运行的其他测试目标争用 `~/.cache/xrpkg`。
+/// 必须在任何下载/构建之前调用。
+pub fn isolate_cache() -> &'static Path {
+    let directory = TEST_CACHE_ROOT.get_or_init(|| {
+        let directory = TempDir::new().expect("创建测试缓存目录失败");
+        std::env::set_var("XDG_CACHE_HOME", directory.path());
+        directory
+    });
+    directory.path()
+}
 
 /// 测试用临时 GPG 身份：私钥在 GNUPGHOME，公钥导出为独立 keyring。
 pub struct TestGpg {

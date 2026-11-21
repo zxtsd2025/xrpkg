@@ -13,6 +13,7 @@ use crate::capability::Capability;
 use crate::deps_map::DependencyMapper;
 use crate::fs_meta::EntryMetadata;
 use crate::hooks::{HookScript, POST_INSTALL, POST_REMOVE, PRE_INSTALL, PRE_REMOVE};
+use crate::rpm_caps;
 use crate::xpkg::{ensure_directory, sanitize_relative, write_file, Rootfs};
 
 /// 本模块使用的错误类型；当前统一用可读字符串。
@@ -144,7 +145,22 @@ pub fn extract_rpm_data(rpm_path: &Path, target_rootfs: &Path) -> Result<Vec<Pat
                     // Ghost 文件只在头里存在，没有载荷内容，不落盘。
                     continue;
                 };
-                let metadata = EntryMetadata::from_mode(file.metadata.permissions() as u32);
+                let mut metadata = EntryMetadata::from_mode(file.metadata.permissions() as u32);
+                if let Some(caps) = file.metadata.caps() {
+                    let caps = caps.trim();
+                    // RPM 用空串或单独的 "=" 表示该文件没有 capability。
+                    if !caps.is_empty() && caps != "=" {
+                        let blob = rpm_caps::encode(caps).map_err(|error| {
+                            format!(
+                                "RPM 文件 `{}` 的 %caps `{caps}` 非法: {error}",
+                                source_path.display()
+                            )
+                        })?;
+                        metadata
+                            .xattrs
+                            .push((std::ffi::OsString::from("security.capability"), blob));
+                    }
+                }
                 let mut reader = Cursor::new(content);
                 write_file(
                     rootfs.path(),

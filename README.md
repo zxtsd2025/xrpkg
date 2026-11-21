@@ -55,6 +55,15 @@ The project targets **glibc 2.44** on x86_64. The recipes currently checked in a
 - **Local `.xpkg` install**  
   `xrpkg install ./foo.xpkg` validates metadata, preflights dependencies, runs the ABI guard, and commits through the same transaction path as repository installs.
 
+- **Process lock for mutating commands**  
+  `install`, `remove`, `--build`, `build-world`, and `init` take an exclusive `flock(2)` lock keyed by the target rootfs and database. A second process fails fast before any write; different targets stay parallel, and a crashed process cannot leave a blocking lock.
+
+- **Post-install cache triggers**  
+  After a successful commit, `ldconfig` and `fc-cache` run from the target rootfs inside the hook sandbox when the transaction touches library or font paths. Failures only print `warning:`; they never roll back committed files.
+
+- **RPM file capabilities**  
+  RPM `%caps` text is parsed into Linux VFS `security.capability` bytes (REVISION_2/3), so files such as `ping` keep their capabilities after a compatibility install.
+
 - **Standardized, localized CLI output**  
   Chinese/English is selected from `LC_ALL`/`LC_MESSAGES`/`LANG`; non-UTF-8 terminals automatically fall back to ASCII English. Actions use `::`, `->`, `[ok]`, `warning:`, and `error:`, with aligned tables; colors only appear on a TTY. `--help`, `--version`, and `list` are first-class commands.
 
@@ -263,7 +272,7 @@ xrpkg install ./package.rpm
 xrpkg install ./package.pkg.tar.zst
 ```
 
-Debian, RPM, and Arch metadata are parsed, dependencies are mapped through `config/deps_map.toml`, and the resulting files and hooks are recorded in the native SQLite database. External packages are not converted into `.xpkg`. The mapping file covers both Debian/RPM dependency names and Arch sonames such as `libz.so` and `libsystemd.so`.
+Debian, RPM, and Arch metadata are parsed, dependencies are mapped through `config/deps_map.toml`, and the resulting files and hooks are recorded in the native SQLite database. External packages are not converted into `.xpkg`. The mapping file covers both Debian/RPM dependency names and Arch sonames such as `libz.so` and `libsystemd.so`. RPM `%caps` strings are converted to Linux VFS `security.capability` bytes; writing that xattr requires root or `CAP_SETFCAP`, and failure aborts the install instead of silently dropping the capability.
 
 Use `--no-deps` when the dependency closure is resolved outside xrpkg (for example a hand-assembled Arch closure): it skips only the preflight check, while the ABI guard and transactional publish still run.
 
@@ -326,6 +335,27 @@ xrpkg install pkg-a=1.0 --allow-downgrade
 
 Without `--allow-downgrade`, a lower target version is rejected before download.
 
+### Concurrent operations
+
+Commands that modify a target rootfs or its database (`install`, including local `.deb`/`.rpm`/`.pkg.tar.zst` files, plus `remove`, `--build`, `build-world`, and `init`) acquire an exclusive `flock(2)` lock before opening the database or touching the filesystem. The lock identity is the pair of target rootfs and database path:
+
+```text
+xrpkg install hello --root /mnt/xros --db /mnt/xros/var/lib/xrpkg/local.db
+# second process with the same pair: fails immediately
+# different --root/--db pairs: run in parallel
+```
+
+A conflicting process prints an error and exits non-zero without writing anything. Locks live under `$XDG_RUNTIME_DIR/xrpkg/locks` (or `/tmp/xrpkg-locks-<uid>` when no runtime directory exists), never enter package manifests, and are released by the kernel if the process crashes. Read-only commands (`list`, `search`, `help`, `version`) do not take the lock.
+
+### Post-install cache triggers
+
+After the transaction and database commit succeed, xrpkg rebuilds target caches at most once per transaction:
+
+- `ldconfig` when published or removed files touch `usr/lib/`, `lib/`, `lib64/`, `usr/lib64/`, `usr/local/lib/`, any `*.so`/`*.so.*`, or `/etc/ld.so.conf*`;
+- `fc-cache` when they touch `usr/share/fonts/`, `usr/local/share/fonts/`, `/etc/fonts/`, or `usr/share/fontconfig/`.
+
+The tools are taken from the target rootfs and executed inside the same chroot sandbox as lifecycle hooks, so the host's glibc never rewrites the target cache. If the tool is missing or exits non-zero, xrpkg prints `warning:` and keeps the committed transaction: `ld.so.cache` and fontconfig caches are not part of a package manifest and can always be rebuilt. `--no-hooks` skips triggers together with hooks.
+
 ### Cache cleanup
 
 ```sh
@@ -366,8 +396,10 @@ src/
   capability.rs  version parsing and package capability constraints
   builder.rs     source recipes, sandbox, logging
   installer.rs   staging, ABI checks, upgrade transactions
+  lock.rs        process lock keyed by rootfs and database
   fs_meta.rs     permissions, ownership, xattrs, and PAX decoding
   transaction.rs atomic publish, snapshots, journal, crash recovery
+  triggers.rs    post-install ldconfig and fc-cache selection/execution
   uninstall.rs   database-driven removal and empty-directory cleanup
   world.rs       recipes/system.toml orchestration (build-world)
   hooks.rs       lifecycle hooks and hook sandbox
@@ -380,6 +412,7 @@ src/
   state.rs       SQLite state
   metadata.rs    scenario/repository TOML loading
   deps_map.rs    external dependency and soname mapping
+  rpm_caps.rs    RPM %caps text to security.capability bytes
   solver.rs      toy solver kept as the resolvo baseline
   resolvo_solver.rs dependency solving
   xpkg.rs        .xpkg writer/reader and safe extraction
@@ -414,9 +447,9 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Current local result: **174 tests passed across 32 test targets**. Some tests require `unshare`, user namespaces, `gpg`, `setcap` (root-only capability test), and `zstd`.
+Current local result: **201 tests passed across 35 test targets**. Some tests require `unshare`, user namespaces, `gpg`, `setcap` (root-only capability test), and `zstd`.
 
-Test binaries share `~/.cache/xrpkg`, so a parallel run can occasionally fail with `Text file busy` (ETXTBSY). Remove `~/.cache/xrpkg/downloads/fetched-*` and rerun; making each test use a private cache directory is a known follow-up.
+Each test binary uses its own temporary `XDG_CACHE_HOME`, so parallel test binaries no longer share `~/.cache/xrpkg` and cannot collide with `Text file busy` (ETXTBSY).
 
 ### Security model and scope
 
@@ -441,7 +474,8 @@ The build sandbox isolates mounts and the filesystem view, but it is not a virtu
 - Only the Arch/Pacman ecosystem is synced in this phase; apt/dnf are not implemented.
 - Repository signatures depend on a system `gpg` installation.
 - The checked-in `repo/xrpkg-repo.toml` indexes only part of `repo/`; regenerate it with `repo-add` before treating it as a complete index.
-- Tests share `~/.cache/xrpkg` and can collide under parallel execution (see Tests).
+- Writing RPM `security.capability` requires root or `CAP_SETFCAP`; the root-only capability test is skipped otherwise.
+- Post-install `ldconfig`/`fc-cache` are best-effort: missing tools or failures only warn and leave committed files in place.
 
 [中文](#zh)
 
@@ -476,6 +510,9 @@ The build sandbox isolates mounts and the filesystem view, but it is not a virtu
 - **Arch 仓库同步与兼容安装**：解析 Pacman `core.db`，并发下载 `.pkg.tar.zst`，通过 ABI 守门后按 `origin = "arch"` 走兼容轨道安装。外部包的升级与卸载同样使用事务快照。
 - **覆盖已有路径的发布**：文件和链接可以覆盖已有的符号链接/硬链接，但绝不通过链接写穿到目标；符号链接可以先指向同批后续文件才会创建的路径，只要最近的已存在祖先仍在 Rootfs 内。`--no-deps` 用于依赖闭包已在 xrpkg 之外解决的场景。
 - **本地 `.xpkg` 安装**：`xrpkg install ./foo.xpkg` 会校验元数据、预检依赖、运行 ABI 守门，并走与仓库安装相同的提交事务。
+- **写操作进程锁**：`install`、`remove`、`--build`、`build-world`、`init` 在打开数据库或写文件之前获取 `flock(2)` 排他锁，身份由目标 Rootfs 和数据库路径共同决定。第二个进程立即失败且不产生部分写入；不同目标可以并行；进程崩溃后内核自动释放锁。
+- **安装后缓存触发器**：事务和数据库提交成功后，按本次发布/删除的文件自动执行目标 Rootfs 的 `ldconfig` / `fc-cache`。失败只打印 `warning:`，不回滚已提交文件。
+- **RPM 文件能力**：解析 RPM `%caps` 文本并编码为 Linux VFS `security.capability`（REVISION_2/3），`ping` 这类文件在兼容安装后仍保留 capability。
 - **标准化、多语言 CLI**：根据 `LC_ALL`/`LC_MESSAGES`/`LANG` 选择中文或英文；非 UTF-8 终端自动回退到 ASCII 英文，避免方块。操作使用 `::`、`->`、`[ok]`、`warning:`、`error:` 和自动对齐表格；颜色只在 TTY 下启用。`--help`、`--version`、`list` 是一等命令。
 - **并发下载与彩色进度条**：每个包显示速度、字节数、百分比和 ETA；stderr 不是终端时自动隐藏。
 - **LFS 配方**：`hello`、`zlib`、`binutils`、`glibc`、`gcc`、`linux`、`bash`、`coreutils`。
@@ -681,7 +718,7 @@ xrpkg install ./package.rpm
 xrpkg install ./package.pkg.tar.zst
 ```
 
-解析 Debian、RPM、Arch 元数据，通过 `config/deps_map.toml` 映射依赖，并把文件与 hooks 记录到 native SQLite 数据库。外部包不会被转换成 `.xpkg`。映射表同时覆盖 Debian/RPM 依赖名和 Arch soname（如 `libz.so`、`libsystemd.so`）。
+解析 Debian、RPM、Arch 元数据，通过 `config/deps_map.toml` 映射依赖，并把文件与 hooks 记录到 native SQLite 数据库。外部包不会被转换成 `.xpkg`。映射表同时覆盖 Debian/RPM 依赖名和 Arch soname（如 `libz.so`、`libsystemd.so`）。RPM 的 `%caps` 文本会转换为 Linux VFS `security.capability` 字节；写入该属性需要 root 或 `CAP_SETFCAP`，失败时安装中止，而不是静默丢掉 capability。
 
 依赖闭包已在 xrpkg 之外解决时（例如手工缝合的 Arch 闭包），可用 `--no-deps` 只跳过预检；ABI 守门和事务发布仍会执行。
 
@@ -744,6 +781,27 @@ xrpkg install pkg-a=1.0 --allow-downgrade
 
 没有 `--allow-downgrade` 时，低于已安装版本的目标会在下载前被拒绝。
 
+### 并发操作
+
+会修改目标 Rootfs 或数据库的命令（`install`——含本地 `.deb`/`.rpm`/`.pkg.tar.zst`——以及 `remove`、`--build`、`build-world`、`init`）在打开数据库或触碰文件系统之前获取 `flock(2)` 排他锁。锁身份是“目标 Rootfs + 数据库路径”：
+
+```text
+xrpkg install hello --root /mnt/xros --db /mnt/xros/var/lib/xrpkg/local.db
+# 相同的 Rootfs/数据库组合：第二个进程立即失败
+# 不同的 --root/--db：可以并行
+```
+
+冲突进程会打印错误并以非 0 退出，且不写入任何文件。锁文件位于 `$XDG_RUNTIME_DIR/xrpkg/locks`（没有运行时目录时用 `/tmp/xrpkg-locks-<uid>`），不会进入包清单；进程崩溃时由内核释放。只读命令（`list`、`search`、`help`、`version`）不加锁。
+
+### 安装后缓存触发器
+
+事务和数据库提交成功后，xrpkg 每个事务最多重建一次目标缓存：
+
+- 发布或删除的文件涉及 `usr/lib/`、`lib/`、`lib64/`、`usr/lib64/`、`usr/local/lib/`、任意 `*.so`/`*.so.*` 或 `/etc/ld.so.conf*` 时执行 `ldconfig`；
+- 涉及 `usr/share/fonts/`、`usr/local/share/fonts/`、`/etc/fonts/` 或 `usr/share/fontconfig/` 时执行 `fc-cache`。
+
+工具取自目标 Rootfs，并在与 hooks 相同的 chroot 沙箱中执行，宿主 glibc 不会改写目标缓存。工具缺失或退出非 0 时只打印 `warning:`，已提交事务保持不变：`ld.so.cache` 与 fontconfig 缓存不在包清单里，可以随时重建。`--no-hooks` 会连触发器一起跳过。
+
 ### 缓存清理
 
 ```sh
@@ -784,8 +842,10 @@ src/
   capability.rs  版本解析与包能力约束
   builder.rs     源码配方、沙箱、日志
   installer.rs   暂存、ABI 校验、升级事务
+  lock.rs        按 Rootfs 与数据库路径加进程锁
   fs_meta.rs     权限、属主、扩展属性与 PAX 解码
   transaction.rs 原子发布、快照、日志与崩溃恢复
+  triggers.rs    安装后 ldconfig / fc-cache 判定与执行
   uninstall.rs   基于数据库的精确卸载与空目录清理
   world.rs       recipes/system.toml 编排（build-world）
   hooks.rs       生命周期 hooks 与 hook 沙箱
@@ -798,6 +858,7 @@ src/
   state.rs       SQLite 状态
   metadata.rs    场景/仓库 TOML 加载
   deps_map.rs    外部依赖与 soname 映射
+  rpm_caps.rs    RPM %caps 文本到 security.capability 字节
   solver.rs      玩具求解器（resolvo 对照基线）
   resolvo_solver.rs 依赖求解
   xpkg.rs        .xpkg 读写与安全解包
@@ -832,9 +893,9 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-当前本地结果：**32 个测试目标、174 个测试通过**。部分测试需要 `unshare`、user namespace、`gpg`、`setcap`（root-only capability 用例）和 `zstd`。
+当前本地结果：**35 个测试目标、201 个测试通过**。部分测试需要 `unshare`、user namespace、`gpg`、`setcap`（root-only capability 用例）和 `zstd`。
 
-测试二进制共用 `~/.cache/xrpkg`，并行运行时偶发 `Text file busy`（ETXTBSY）。删除 `~/.cache/xrpkg/downloads/fetched-*` 后重跑即可；让每个测试使用独立缓存目录是已知的后续改进。
+每个测试二进制使用独立的临时 `XDG_CACHE_HOME`，并行运行的测试目标不再共用 `~/.cache/xrpkg`，不会再出现 `Text file busy`（ETXTBSY）冲突。
 
 ### 安全模型与边界
 
@@ -859,6 +920,7 @@ cargo fmt --check
 - 本阶段只同步 Arch/Pacman 生态，尚未实现 apt/dnf。
 - 仓库签名依赖系统 `gpg`。
 - 仓库内 `repo/xrpkg-repo.toml` 只索引了 `repo/` 的一部分产物；把它当完整索引前先用 `repo-add` 重新生成。
-- 测试共用 `~/.cache/xrpkg`，并行执行时可能相互干扰（见“测试”）。
+- 写入 RPM `security.capability` 需要 root 或 `CAP_SETFCAP`；非 root 时 root-only 能力测试会明确跳过。
+- 安装后 `ldconfig`/`fc-cache` 是 best-effort：工具缺失或失败只告警，已提交文件保持不变。
 
 [English](#english)

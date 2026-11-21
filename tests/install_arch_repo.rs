@@ -55,6 +55,7 @@ fn arch_package() -> Vec<u8> {
 
 #[test]
 fn installs_arch_package_from_repository_and_runs_it() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let repo_dir = temp.path().join("repo");
     let mirror = temp.path().join("mirror");

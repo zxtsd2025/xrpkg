@@ -35,6 +35,7 @@ package = [
 
 #[test]
 fn clean_keeps_installed_and_latest_and_removes_old_cache_packages() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let repo_dir = temp.path().join("repo");
     let gpg = common::TestGpg::new(temp.path());
@@ -90,6 +91,7 @@ fn clean_keeps_installed_and_latest_and_removes_old_cache_packages() {
 
 #[test]
 fn clean_reports_zero_for_empty_cache() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let repo_dir = temp.path().join("repo");
     let gpg = common::TestGpg::new(temp.path());
@@ -108,6 +110,7 @@ fn clean_reports_zero_for_empty_cache() {
 
 #[test]
 fn clean_cli_runs_and_reports_zero_for_empty_cache() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let repo_dir = temp.path().join("repo");
     let gpg = common::TestGpg::new(temp.path());

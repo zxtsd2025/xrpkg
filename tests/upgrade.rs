@@ -1,3 +1,5 @@
+mod common;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -102,6 +104,7 @@ fn install_variant_with(
 
 #[test]
 fn upgrades_files_hooks_and_removes_obsolete_files() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let v1 = build_variant(
         &temp,
@@ -151,6 +154,7 @@ fn upgrades_files_hooks_and_removes_obsolete_files() {
 
 #[test]
 fn corrupted_new_archive_leaves_old_version_untouched() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let v1 = build_variant(
         &temp,
@@ -176,6 +180,7 @@ fn corrupted_new_archive_leaves_old_version_untouched() {
 
 #[test]
 fn latest_resolver_selects_the_newer_version() {
+    common::isolate_cache();
     let installed = InstalledPackage {
         name: "pkg-a".to_string(),
         version: Version::parse("1.0").unwrap(),
@@ -202,6 +207,7 @@ fn latest_resolver_selects_the_newer_version() {
 }
 #[test]
 fn failed_post_upgrade_restores_old_files_and_database() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let v1 = build_variant(
         &temp,
@@ -231,6 +237,7 @@ fn failed_post_upgrade_restores_old_files_and_database() {
 
 #[test]
 fn explicit_downgrade_replaces_files_and_removes_newer_only_files() {
+    common::isolate_cache();
     let temp = TempDir::new().unwrap();
     let v1 = build_variant(
         &temp,

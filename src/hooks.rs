@@ -56,27 +56,11 @@ pub fn run_hook(
         format!("执行 {phase} hook: {package_name} {package_version}"),
         format!("Running {phase} hook: {package_name} {package_version}"),
     ));
-    let sandbox = Sandbox::create(rootfs, package_name, package_version, script)?;
-    let output = Command::new("unshare")
-        .args([
-            "--user",
-            "--map-root-user",
-            "--mount",
-            "--pid",
-            "--fork",
-            "/bin/sh",
-        ])
-        .arg(sandbox.setup_path())
-        .output()
-        .map_err(|error| format!("启动 chroot 沙箱失败: {error}"))?;
+    let label = format!("hook-{package_name}-{package_version}");
+    let environment = [("PKG_NAME", package_name), ("PKG_VERSION", package_version)];
+    let output = run_in_sandbox(rootfs, &label, script, &environment)?;
 
-    if !output.stdout.is_empty() {
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-    }
-    if !output.stderr.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    }
-
+    print_output(&output);
     if !output.status.success() {
         let code = output
             .status
@@ -90,6 +74,50 @@ pub fn run_hook(
     Ok(())
 }
 
+/// 在同一个 chroot 沙箱中执行一段内部脚本，并返回原始输出。
+///
+/// 安装后触发器用它执行目标 Rootfs 自己的 `ldconfig`/`fc-cache`；与 hook
+/// 共用沙箱，避免把宿主 `/etc`、`/home` 暴露给目标工具。
+pub(crate) fn run_script_in_sandbox(
+    rootfs: &Rootfs,
+    label: &str,
+    script: &[u8],
+) -> Result<std::process::Output, Error> {
+    run_in_sandbox(rootfs, label, script, &[])
+}
+
+/// 创建沙箱并执行脚本；调用方负责解释输出。
+fn run_in_sandbox(
+    rootfs: &Rootfs,
+    label: &str,
+    script: &[u8],
+    environment: &[(&str, &str)],
+) -> Result<std::process::Output, Error> {
+    let sandbox = Sandbox::create(rootfs, label, script, environment)?;
+    Command::new("unshare")
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--pid",
+            "--fork",
+            "/bin/sh",
+        ])
+        .arg(sandbox.setup_path())
+        .output()
+        .map_err(|error| format!("启动 chroot 沙箱失败: {error}"))
+}
+
+/// 把子进程输出转发到当前终端。
+fn print_output(output: &std::process::Output) {
+    if !output.stdout.is_empty() {
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+}
+
 /// 一次 hook 执行的沙箱目录；Drop 时清理。
 struct Sandbox {
     path: PathBuf,
@@ -97,16 +125,21 @@ struct Sandbox {
 }
 
 impl Sandbox {
-    /// 创建沙箱、复制 shell 依赖、写入 hook 和 setup 脚本。
+    /// 创建沙箱、复制 shell 依赖、写入待执行脚本和 setup 脚本。
     fn create(
         rootfs: &Rootfs,
-        package_name: &str,
-        package_version: &str,
+        label: &str,
         script: &[u8],
+        environment: &[(&str, &str)],
     ) -> Result<Self, Error> {
         let base = PathBuf::from("/var/tmp/xrpkg-hooks");
         fs::create_dir_all(&base).map_err(|error| format!("创建 hook 沙箱根目录失败: {error}"))?;
-        let path = base.join(format!("hook-{}-{}", std::process::id(), nonce()));
+        let path = base.join(format!(
+            "{}-{}-{}",
+            sanitize_label(label),
+            std::process::id(),
+            nonce()
+        ));
         fs::create_dir(&path)
             .map_err(|error| format!("创建 hook 沙箱 `{}` 失败: {error}", path.display()))?;
 
@@ -129,6 +162,11 @@ impl Sandbox {
         fs::write(&hook_path, script)
             .map_err(|error| format!("写入 hook 脚本 `{}` 失败: {error}", hook_path.display()))?;
 
+        let environment = environment
+            .iter()
+            .map(|(key, value)| format!("{key}={}", quote_arg(value)))
+            .collect::<Vec<_>>()
+            .join(" ");
         let setup = path.join("setup.sh");
         let rootfs_path = rootfs.path().to_path_buf();
         let setup_text = format!(
@@ -136,14 +174,11 @@ impl Sandbox {
              mount --bind /usr/bin {sandbox}/usr/bin\n\
              mount -o remount,ro,bind {sandbox}/usr/bin\n\
              mount --bind {rootfs} {sandbox}/target\n\
-             exec chroot {sandbox} /usr/bin/env \
-                 PKG_NAME={pkg_name} PKG_VERSION={pkg_version} \
+             exec chroot {sandbox} /usr/bin/env {environment} \
                  XRPKG_ROOTFS=/target PATH=/usr/bin:/bin HOME=/tmp TMPDIR=/tmp \
                  /bin/bash /hook.sh\n",
             sandbox = shell_quote(&path),
             rootfs = shell_quote(&rootfs_path),
-            pkg_name = quote_arg(package_name),
-            pkg_version = quote_arg(package_version),
         );
         fs::write(&setup, setup_text)
             .map_err(|error| format!("写入沙箱 setup 脚本 `{}` 失败: {error}", setup.display()))?;
@@ -219,6 +254,21 @@ fn collect_ldd_libraries(binary: &Path, libraries: &mut BTreeSet<PathBuf>) -> Re
 
 fn shell_quote(path: &Path) -> String {
     quote_arg(&path.to_string_lossy())
+}
+
+/// 把沙箱标签限制为安全的文件名片段，避免包名中的 `/` 逃出沙箱目录。
+fn sanitize_label(label: &str) -> String {
+    let sanitized = label
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    sanitized.chars().take(64).collect()
 }
 
 fn quote_arg(text: &str) -> String {

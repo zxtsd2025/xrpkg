@@ -9,7 +9,7 @@
 - [x] 阶段 29.5、30、32：CLI 输出标准化与多语言、事务/元数据加固、XFCE/Xorg 兼容安装（阶段 31 仍在进行）。
 
 ## 当前架构环境
-- **宿主机**：VirtualBox 中的 Arch Linux（通过 VS Code Remote-SSH 连接）。
+- **开发环境**：原生 Arch Linux（内核 `7.3.5-arch1-1`，x86_64）。项目最早在 WSL2 上开发，现已迁移；WSL/Windows 路径说明全部废弃。
 - **目标系统**：XROS beta1.0（运行在 NVMe 硬盘 `/dev/nvme0n1` 上，已完美启动并拥有 root 权限）。
 - **核心工具**：`xrpkg` 已在 XROS 内可用，但原生的系统包还很少，主要依赖兼容轨道（缝合 Arch 包）。
 

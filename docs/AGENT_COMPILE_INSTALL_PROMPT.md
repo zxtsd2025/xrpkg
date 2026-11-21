@@ -1,6 +1,6 @@
 # xrpkg 编译安装 · Agent 提示词
 
-> 用法：把下面整段复制给新的 agent。默认在仓库所在 Arch/WSL 环境编译并安装 release 二进制；如果目标机是 XROS，请先向用户确认传输方式和安装路径，不要直接操作磁盘。
+> 用法：把下面整段复制给新的 agent。默认在仓库所在的 Arch Linux 环境编译并安装 release 二进制；如果目标机是 XROS，请先向用户确认传输方式和安装路径，不要直接操作磁盘。
 
 ---
 
@@ -8,7 +8,7 @@
 
 ## 环境与位置
 
-- 仓库：`/home/zxtsd/xrpkg`（WSL Arch Linux 上的 ext4 路径；Windows 侧 UNC 为 `\\wsl.localhost\archlinux\home\zxtsd\xrpkg`，所有 cargo 命令应在 WSL 内执行）
+- 仓库：`/home/zxtsd/xrpkg`（当前开发机为原生 Arch Linux，cargo 命令直接在本机 shell 执行；WSL 只是早期历史环境，不要再使用 WSL/Windows 路径）
 - 工具链：`cargo` / `rustc` 1.100（若提示 “no default toolchain is configured”，在命令前加 `RUSTUP_TOOLCHAIN=stable`，或执行 `rustup default stable`）
 - 构建依赖：C 工具链、`gpg`、`tar`、`gzip`、`zstd`、`unshare`
 - 网络：首次构建可能需要访问 crates.io；Arch 同步测试/实跑还需要访问镜像源
@@ -150,7 +150,7 @@ xrpkg sync 2>&1 | head -n 3
 ## 可直接复制的短版
 
 ```text
-你接手 /home/zxtsd/xrpkg（xrpkg 阶段 32，WSL Arch，Rust 1.100）。请先读 AGENTS.md、README.md、PROGRESS.md，然后完成编译、验证和安装：
+你接手 /home/zxtsd/xrpkg（xrpkg 阶段 32，Arch Linux，Rust 1.100）。请先读 AGENTS.md、README.md、PROGRESS.md，然后完成编译、验证和安装：
 1) cd /home/zxtsd/xrpkg
 2) cargo fmt --check
 3) cargo clippy --all-targets -- -D warnings
